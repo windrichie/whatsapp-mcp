@@ -253,6 +253,9 @@ type SendMessageRequest struct {
 	Recipient string `json:"recipient"`
 	Message   string `json:"message"`
 	MediaPath string `json:"media_path,omitempty"`
+	// SourcePath is the user's original file when the MCP server converted it into
+	// the outbox (voice messages). It must satisfy the same policy as MediaPath.
+	SourcePath string `json:"source_path,omitempty"`
 }
 
 // outgoingMedia is a validated local file that is about to be uploaded
@@ -637,12 +640,14 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, cfg *Co
 		return false, "", "", "", fmt.Errorf("failed to get absolute path: %v", err)
 	}
 
-	// Check if file already exists
+	// Return an earlier download only if it is intact; otherwise download it again
 	if fi, err := os.Lstat(localPath); err == nil {
 		if !fi.Mode().IsRegular() {
 			return false, "", "", "", fmt.Errorf("unexpected file type at media path")
 		}
-		return true, info.Type, info.Filename, absPath, nil
+		if fileMatchesSHA256(localPath, info.FileSHA256) {
+			return true, info.Type, info.Filename, absPath, nil
+		}
 	}
 
 	directPath := info.DirectPath
@@ -762,6 +767,16 @@ func (s *apiServer) handleSend(w http.ResponseWriter, r *http.Request) {
 		mediaPath, err = s.cfg.resolveSendablePath(req.MediaPath)
 		if err != nil {
 			writeError(w, http.StatusForbidden, err.Error())
+			return
+		}
+	}
+	if req.SourcePath != "" {
+		if req.MediaPath == "" {
+			writeError(w, http.StatusBadRequest, "source_path requires media_path")
+			return
+		}
+		if _, err := s.cfg.resolveSendablePath(req.SourcePath); err != nil {
+			writeError(w, http.StatusForbidden, "source file: "+err.Error())
 			return
 		}
 	}
@@ -894,7 +909,7 @@ func main() {
 		}
 	}
 
-	cfg.APIToken, err = loadOrCreateToken(cfg.StoreDir)
+	cfg.APIToken, err = loadToken(cfg.StoreDir)
 	if err != nil {
 		logger.Errorf("Failed to load API token: %v", err)
 		return
@@ -931,6 +946,8 @@ func main() {
 		logger.Errorf("Failed to create WhatsApp client")
 		return
 	}
+	// Bound media downloads by bytes actually received, not the sender's declared size
+	client.SetMediaHTTPClient(newMediaHTTPClient(cfg.MaxMediaBytes))
 
 	// Initialize message store
 	messageStore, err := NewMessageStore(cfg.StoreDir)

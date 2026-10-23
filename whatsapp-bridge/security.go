@@ -27,7 +27,7 @@ import (
 
 const (
 	defaultListenAddr     = "127.0.0.1:8080"
-	maxRequestBodyBytes   = 128 << 10 // JSON bodies only carry text and file paths
+	maxRequestBodyBytes   = 256 << 10 // text and paths; JSON escaping can triple non-ASCII text
 	maxMessageBytes       = 64 << 10
 	defaultMaxMediaMB     = 100
 	defaultSendRatePerMin = 10
@@ -184,9 +184,11 @@ func writePrivateFile(path string, data []byte) error {
 // API authentication
 // ---------------------------------------------------------------------------
 
-// loadOrCreateToken returns the shared secret the MCP server must present. It comes
-// from WHATSAPP_BRIDGE_TOKEN, or from <store>/api_token, which is generated on first run.
-func loadOrCreateToken(storeDir string) (string, error) {
+// loadToken returns the shared secret the MCP server must present. It comes from
+// WHATSAPP_BRIDGE_TOKEN, or is freshly generated on every start and written to
+// <store>/api_token, so a token captured earlier (e.g. by another local user
+// squatting the port while the bridge was down) stops working on restart.
+func loadToken(storeDir string) (string, error) {
 	if t := strings.TrimSpace(os.Getenv("WHATSAPP_BRIDGE_TOKEN")); t != "" {
 		if len(t) < minTokenLength {
 			return "", fmt.Errorf("WHATSAPP_BRIDGE_TOKEN must be at least %d characters", minTokenLength)
@@ -195,15 +197,6 @@ func loadOrCreateToken(storeDir string) (string, error) {
 	}
 
 	path := filepath.Join(storeDir, tokenFileName)
-	data, err := os.ReadFile(path)
-	if err == nil {
-		if t := strings.TrimSpace(string(data)); len(t) >= minTokenLength {
-			return t, os.Chmod(path, 0o600)
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return "", fmt.Errorf("failed to read API token: %w", err)
-	}
-
 	buf := make([]byte, 32)
 	if _, err := rand.Read(buf); err != nil {
 		return "", fmt.Errorf("failed to generate API token: %w", err)
@@ -513,9 +506,24 @@ func safePathComponent(s string) string {
 	return "x" + hex.EncodeToString(sum[:12])
 }
 
+// Extensions kept for downloaded attachments. Anything else is saved as .bin, so a
+// sender cannot drop file types that the OS acts on when a folder is merely viewed
+// (.url, .scf, .library-ms, .lnk, .desktop, ...).
+var allowedMediaExtensions = map[string]bool{
+	"jpg": true, "jpeg": true, "png": true, "gif": true, "webp": true, "heic": true,
+	"mp4": true, "mov": true, "3gp": true, "mkv": true, "webm": true, "avi": true,
+	"ogg": true, "opus": true, "mp3": true, "m4a": true, "aac": true, "amr": true, "wav": true,
+	"pdf": true, "txt": true, "csv": true, "rtf": true, "md": true, "json": true,
+	"doc": true, "docx": true, "xls": true, "xlsx": true, "ppt": true, "pptx": true,
+	"odt": true, "ods": true, "odp": true, "pages": true, "numbers": true, "key": true,
+	"zip": true, "7z": true, "rar": true, "gz": true, "tar": true,
+	"epub": true, "vcf": true, "ics": true,
+}
+
 func mediaExtension(mediaType, filename string) string {
-	if ext := strings.TrimPrefix(filepath.Ext(filename), "."); safeExtRe.MatchString(ext) {
-		return "." + strings.ToLower(ext)
+	ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(filename), "."))
+	if safeExtRe.MatchString(ext) && allowedMediaExtensions[ext] {
+		return "." + ext
 	}
 	switch mediaType {
 	case "image":
@@ -529,15 +537,96 @@ func mediaExtension(mediaType, filename string) string {
 }
 
 // mediaFilePath builds the local path for a downloaded attachment. The sender's
-// filename only contributes a sanitised extension, never directory components.
+// filename only contributes an allowlisted extension, never directory components.
+// A hash of the exact chat and message ID keeps IDs that differ only in letter case
+// apart on case-insensitive filesystems (macOS, Windows).
 func (c *Config) mediaFilePath(chatJID, messageID, mediaType, filename string) (string, error) {
-	name := safePathComponent(mediaType) + "_" + safePathComponent(messageID) + mediaExtension(mediaType, filename)
+	sum := sha256.Sum256([]byte(chatJID + "\x00" + messageID))
+	name := safePathComponent(mediaType) + "_" + safePathComponent(messageID) + "_" +
+		hex.EncodeToString(sum[:4]) + mediaExtension(mediaType, filename)
 	p := filepath.Join(c.MediaDir, safePathComponent(chatJID), name)
 	rel, err := filepath.Rel(c.MediaDir, p)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return "", errors.New("unsafe media path")
 	}
 	return p, nil
+}
+
+// fileMatchesSHA256 reports whether the file at path has the expected SHA-256.
+func fileMatchesSHA256(path string, want []byte) bool {
+	if len(want) != sha256.Size {
+		return false
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return false
+	}
+	return subtle.ConstantTimeCompare(h.Sum(nil), want) == 1
+}
+
+var errMediaTooLarge = errors.New("media download exceeds the size limit")
+
+// mediaOverhead covers AES-CBC padding and the HMAC appended to encrypted media.
+const mediaOverhead = 64 << 10
+
+// limitedBodyTransport caps every media HTTP response body. The sender declares the
+// file length in the message, so it cannot be trusted to bound the download.
+type limitedBodyTransport struct {
+	base  http.RoundTripper
+	limit int64
+}
+
+func (t *limitedBodyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.base.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.ContentLength > t.limit {
+		resp.Body.Close()
+		return nil, errMediaTooLarge
+	}
+	resp.Body = &limitedReadCloser{rc: resp.Body, remaining: t.limit}
+	return resp, nil
+}
+
+type limitedReadCloser struct {
+	rc        io.ReadCloser
+	remaining int64
+}
+
+func (l *limitedReadCloser) Read(p []byte) (int, error) {
+	if l.remaining <= 0 {
+		var probe [1]byte
+		if n, err := l.rc.Read(probe[:]); n > 0 {
+			return 0, errMediaTooLarge
+		} else {
+			return 0, err
+		}
+	}
+	if int64(len(p)) > l.remaining {
+		p = p[:l.remaining]
+	}
+	n, err := l.rc.Read(p)
+	l.remaining -= int64(n)
+	return n, err
+}
+
+func (l *limitedReadCloser) Close() error {
+	return l.rc.Close()
+}
+
+func newMediaHTTPClient(maxMediaBytes int64) *http.Client {
+	return &http.Client{
+		Transport: &limitedBodyTransport{
+			base:  http.DefaultTransport.(*http.Transport).Clone(),
+			limit: maxMediaBytes + mediaOverhead,
+		},
+	}
 }
 
 func validDirectPath(p string) bool {

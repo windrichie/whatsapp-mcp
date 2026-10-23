@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
+	"io"
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
@@ -134,18 +136,25 @@ func TestTokenAndFilePermissions(t *testing.T) {
 	assertMode(t, dir, 0o700)
 
 	t.Setenv("WHATSAPP_BRIDGE_TOKEN", "")
-	tok1, err := loadOrCreateToken(dir)
+	tok1, err := loadToken(dir)
 	if err != nil || len(tok1) != 64 {
 		t.Fatalf("token = %q, %v", tok1, err)
 	}
 	assertMode(t, filepath.Join(dir, tokenFileName), 0o600)
-	tok2, _ := loadOrCreateToken(dir)
-	if tok1 != tok2 {
-		t.Error("token changed between loads")
+	tok2, _ := loadToken(dir)
+	if tok1 == tok2 {
+		t.Error("token was not rotated on restart")
+	}
+	if onDisk, _ := os.ReadFile(filepath.Join(dir, tokenFileName)); strings.TrimSpace(string(onDisk)) != tok2 {
+		t.Error("token file does not hold the current token")
 	}
 
+	t.Setenv("WHATSAPP_BRIDGE_TOKEN", testToken)
+	if tok, _ := loadToken(dir); tok != testToken {
+		t.Error("WHATSAPP_BRIDGE_TOKEN was not used")
+	}
 	t.Setenv("WHATSAPP_BRIDGE_TOKEN", "short")
-	if _, err := loadOrCreateToken(dir); err == nil {
+	if _, err := loadToken(dir); err == nil {
 		t.Error("accepted a short WHATSAPP_BRIDGE_TOKEN")
 	}
 
@@ -260,6 +269,10 @@ func TestAPIRequestGuards(t *testing.T) {
 		{name: "session db", body: `{"recipient":"447700900123","media_path":"` + secret + `"}`, status: 403},
 		{name: "traversal out of outbox", body: `{"recipient":"447700900123","media_path":"` + cfg.OutboxDir + `/../whatsapp.db"}`, status: 403},
 		// Valid requests pass every check and stop only because there is no WhatsApp connection.
+		{name: "long non-ascii message", body: `{"recipient":"447700900123","message":"` + strings.Repeat(`\u0436`, 27500) + `"}`, status: 503},
+		{name: "source outside allowlist", body: `{"recipient":"447700900123","media_path":"` + inOutbox + `","source_path":"/etc/passwd"}`, status: 403},
+		{name: "source without media", body: `{"recipient":"447700900123","message":"hi","source_path":"` + inOutbox + `"}`, status: 400},
+		{name: "valid source", body: `{"recipient":"447700900123","media_path":"` + inOutbox + `","source_path":"` + inOutbox + `"}`, status: 503},
 		{name: "valid text", body: valid, status: 503},
 		{name: "valid media", body: `{"recipient":"447700900123","media_path":"` + inOutbox + `"}`, status: 503},
 		{name: "download traversal id", path: "/api/download", body: `{"message_id":"../../x","chat_jid":"x@s.whatsapp.net"}`, status: 500},
@@ -410,8 +423,89 @@ func TestMediaFilePathStaysInsideMediaDir(t *testing.T) {
 		}
 	}
 	p, _ := cfg.mediaFilePath("447700900123@s.whatsapp.net", "3EB0C767D26A1D2D", "document", "report.PDF")
-	if want := filepath.Join(cfg.MediaDir, "447700900123@s.whatsapp.net", "document_3EB0C767D26A1D2D.pdf"); p != want {
-		t.Errorf("readable path = %q, want %q", p, want)
+	dir, name := filepath.Split(p)
+	if dir != filepath.Join(cfg.MediaDir, "447700900123@s.whatsapp.net")+string(filepath.Separator) ||
+		!strings.HasPrefix(name, "document_3EB0C767D26A1D2D_") || !strings.HasSuffix(name, ".pdf") {
+		t.Errorf("readable path = %q", p)
+	}
+
+	// IDs differing only in case must not share a file on case-insensitive filesystems.
+	upper, _ := cfg.mediaFilePath("447700900123@s.whatsapp.net", "3EB0ABCDEF", "image", "")
+	lower, _ := cfg.mediaFilePath("447700900123@s.whatsapp.net", "3eb0abcdef", "image", "")
+	if strings.EqualFold(upper, lower) {
+		t.Errorf("case-only ID difference collides: %q vs %q", upper, lower)
+	}
+}
+
+func TestMediaExtensionAllowlist(t *testing.T) {
+	cases := map[string]string{
+		"report.pdf": ".pdf", "Sheet.XLSX": ".xlsx", "photo.jpeg": ".jpeg",
+		"open-me.url": ".bin", "x.scf": ".bin", "a.library-ms": ".bin", "b.lnk": ".bin",
+		"c.desktop": ".bin", "d.command": ".bin", "e.exe": ".bin", "noext": ".bin", "f.html": ".bin",
+	}
+	for name, want := range cases {
+		if got := mediaExtension("document", name); got != want {
+			t.Errorf("mediaExtension(document, %q) = %q, want %q", name, got, want)
+		}
+	}
+	if got := mediaExtension("image", "evil.url"); got != ".jpg" {
+		t.Errorf("image fallback = %q", got)
+	}
+}
+
+func TestCachedDownloadIsVerified(t *testing.T) {
+	cfg := testConfig(t)
+	store := testStore(t, cfg)
+	chat := "447700900123@s.whatsapp.net"
+	store.StoreChat(chat, "Alice", time.Now())
+	good := []byte("real image bytes")
+	sum := sha256.Sum256(good)
+	media := MediaInfo{Type: "image", Filename: "image.jpg", DirectPath: "/v/t62/x.enc?oh=1",
+		MediaKey: []byte{1}, FileSHA256: sum[:], FileEncSHA256: []byte{1}, FileLength: uint64(len(good))}
+	store.StoreMessage("IMG1", chat, "447700900123", "", time.Now(), false, media)
+	path, _ := cfg.mediaFilePath(chat, "IMG1", "image", "image.jpg")
+	writeFile(t, path, string(good))
+
+	if ok, _, _, got, err := downloadMedia(nil, store, cfg, "IMG1", chat); !ok || err != nil || filepath.Base(got) != filepath.Base(path) {
+		t.Fatalf("intact cached file not returned: %v %q %v", ok, got, err)
+	}
+	writeFile(t, path, "planted by someone else")
+	if ok, _, _, _, err := downloadMedia(nil, store, cfg, "IMG1", chat); ok || err == nil {
+		t.Fatal("tampered cached file was returned instead of being re-downloaded")
+	}
+}
+
+func TestMediaHTTPClientCapsBodies(t *testing.T) {
+	payload := strings.Repeat("x", 1000)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/chunked" {
+			w.(http.Flusher).Flush() // no Content-Length
+		}
+		io.WriteString(w, payload)
+	}))
+	defer srv.Close()
+
+	for _, path := range []string{"/sized", "/chunked"} {
+		small := &http.Client{Transport: &limitedBodyTransport{base: http.DefaultTransport, limit: 999}}
+		resp, err := small.Get(srv.URL + path)
+		if err == nil {
+			_, err = io.ReadAll(resp.Body)
+			resp.Body.Close()
+		}
+		if err == nil {
+			t.Errorf("%s: body over the limit was accepted", path)
+		}
+
+		exact := &http.Client{Transport: &limitedBodyTransport{base: http.DefaultTransport, limit: 1000}}
+		resp, err = exact.Get(srv.URL + path)
+		if err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		data, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil || len(data) != 1000 {
+			t.Errorf("%s: body at the limit failed: %d bytes, %v", path, len(data), err)
+		}
 	}
 }
 
@@ -518,9 +612,9 @@ func TestRateLimiter(t *testing.T) {
 }
 
 func TestSanitizeForLog(t *testing.T) {
-	in := "Mallory\x1b]52;c;cHduZWQ=\x07\n‮evil"
+	in := "Mallory\x1b]52;c;cHduZWQ=\x07\n\u202eevil"
 	out := sanitizeForLog(in)
-	if strings.ContainsAny(out, "\x1b\x07\n‮") {
+	if strings.ContainsAny(out, "\x1b\x07\n\u202e") {
 		t.Errorf("control characters survived: %q", out)
 	}
 }

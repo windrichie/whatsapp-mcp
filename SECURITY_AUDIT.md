@@ -1,7 +1,7 @@
 # Security audit of `lharries/whatsapp-mcp`
 
 **Audited revision:** upstream `main` at commit `7d6a06d` (bridge `main.go`, MCP server `main.py`, `whatsapp.py`, `audio.py`, `go.mod`, `uv.lock`).
-**Fixed in:** the `security-hardening` branch of this fork.
+**Fixed in:** the `security-hardening` branch of this fork (see also [Independent review follow-up](#independent-review-follow-up)).
 **Date:** 2026-10-23
 
 ## Summary
@@ -366,14 +366,42 @@ file after sending.
   the protection there comes from your profile directory's ACLs.
 - **Path-check race.** There is a time-of-check/time-of-use window between path
   validation and `open`. Exploiting it needs write access to an allowed directory.
+- **Shared machines.** On a machine shared with untrusted users, another user can bind
+  `127.0.0.1:8080` while the bridge is stopped. The MCP server would then send that user
+  the text and file paths of any messages you try to send. Token rotation stops the
+  captured token being reused, but use a single-user machine for this tool.
 - **Not tested against a live account.** Testing covered compilation, unit, fuzz and
   MCP-over-stdio integration tests, but not a live WhatsApp account (none was available in
   the audit environment). After the whatsmeow upgrade, re-pair if prompted, and check that
   sending, receiving and media download work.
 
+## Independent review follow-up
+
+A second, independent adversarial review of the hardening branch found no bypass of the
+core controls. It ran:
+
+- 14 Host-header variants against the API guard;
+- a 116k-input differential fuzz of recipient parsing between Go and Python;
+- 2M fuzzed media direct paths;
+- symlink, `..`, 8.3 short-name and store-secret probes against the path allowlist.
+
+It did find the following, all now fixed:
+
+| Severity | Issue | Fix |
+|---|---|---|
+| High (regression) | `go run main.go` no longer built, because the bridge now has two source files | Docs use `go run .` |
+| Medium | Invisible Unicode (tag characters U+E0000–E007F, zero-width characters, variation-selector runs) passed the output sanitiser, so hidden instructions could reach the model unseen by the user | All format (Cf) characters are removed except ZWJ/ZWNJ, along with invisible filler letters and variation-selector supplements. Runs of joiners or selectors are collapsed to one, so multi-part emoji and Indic or Persian text still render correctly. Message IDs are sanitised too |
+| Low–Medium | A sender could declare `fileLength=1` for a ~2 GB document; the bridge then buffered the whole download in memory | Media HTTP responses are capped at `WHATSAPP_MAX_MEDIA_MB` (+64 KiB) by bytes actually received (`SetMediaHTTPClient`) |
+| Low | Message IDs differing only in case collided on case-insensitive filesystems, and an existing download was returned without verification | Download names include a hash of the exact chat and ID, and cached files are returned only if their SHA-256 matches |
+| Low | Sender-chosen document extensions such as `.url`, `.scf` and `.library-ms` can leak Windows NTLM hashes just by viewing the folder | Extension allowlist; anything else is saved as `.bin` |
+| Low | For converted voice messages, only the MCP server checked the original file | The bridge also validates `source_path` |
+| Low | Another local user could squat port 8080 while the bridge was down and capture the token | The token is regenerated on every bridge start (see residual risk) |
+| Low (regression) | 128 KiB body cap rejected long non-ASCII messages after JSON escaping | Raised to 256 KiB |
+| Low (regression) | `.wma` audio was rejected by the ffmpeg format whitelist | Added `asf` and `au` |
+
 ## Test coverage added
 
-- **`whatsapp-bridge/security_test.go`** (18 tests + fuzz target) covers:
+- **`whatsapp-bridge/security_test.go`** (21 tests + fuzz target) covers:
   - recipient parsing;
   - config validation;
   - token and file permissions;
@@ -381,11 +409,14 @@ file after sending.
     fields, allowlist, read-only, rate limit);
   - the media path allowlist (symlink, hidden, store secrets, FIFO);
   - download-path containment against hostile filenames, IDs and JIDs;
+  - the extension allowlist, case-collision naming and cached-file verification;
+  - the media download size cap;
   - the cross-sender overwrite fix and the schema migration;
   - direct-path validation;
   - the Ogg parser (fixture duration + 2,000 mutated inputs + fuzzing).
-- **`whatsapp-mcp-server/tests/test_security.py`** (24 tests) covers:
-  - transcript-forgery resistance and control/bidi stripping;
+- **`whatsapp-mcp-server/tests/test_security.py`** (31 tests) covers:
+  - transcript-forgery resistance, control/bidi stripping and invisible-Unicode removal
+    (with emoji and script preservation);
   - exact matching and `LIKE` escaping;
   - query clamps;
   - the read-only DB;
@@ -393,7 +424,7 @@ file after sending.
   - the recipient allowlist;
   - token use with proxy settings ignored;
   - the loopback-only bridge URL;
-  - the audio conversion lifecycle and the ffmpeg playlist refusal;
+  - the audio conversion lifecycle, common input formats and the ffmpeg playlist refusal;
   - a full MCP stdio round-trip checking instructions, tool annotations and structured
     output;
   - read-only mode hiding the send tools.

@@ -4,7 +4,7 @@ import tempfile
 
 # Only real audio/video container demuxers may read the input. This stops a crafted
 # playlist (.m3u8, concat, ...) from pulling other local files into the voice message.
-_ALLOWED_INPUT_FORMATS = "mp3,wav,ogg,flac,mov,aac,matroska,amr,caf,aiff,w64"
+_ALLOWED_INPUT_FORMATS = "mp3,wav,ogg,flac,mov,aac,matroska,amr,caf,aiff,w64,asf,au"
 _FFMPEG_TIMEOUT_SECONDS = 120
 
 def convert_to_opus_ogg(input_file, output_file=None, bitrate="32k", sample_rate=24000):

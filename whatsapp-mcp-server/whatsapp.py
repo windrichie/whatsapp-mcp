@@ -35,7 +35,11 @@ MEDIA_REQUEST_TIMEOUT = (5, 600)
 _session = requests.Session()
 _session.trust_env = False
 
-_BIDI_CONTROLS = set("؜‎‏‪‫‬‭‮⁦⁧⁨⁩")
+# Zero-width (non-)joiners are needed by emoji sequences and several scripts; every other
+# format character (bidi overrides, zero-width spaces, Unicode "tag" characters, ...) is removed.
+_JOINERS = {"\u200c", "\u200d"}
+# Invisible letters often used to make blank-looking names or hide text.
+_INVISIBLE_LETTERS = set("\u034f\u115f\u1160\u3164\uffa0")
 
 
 class BridgeError(Exception):
@@ -47,22 +51,36 @@ class BridgeError(Exception):
 # ---------------------------------------------------------------------------
 
 def clean_text(value: Optional[str]) -> Optional[str]:
-    """Strip control and bidi-override characters from third-party text.
+    """Strip control, format and invisible characters from third-party text.
 
     Message bodies and names are written by other WhatsApp users. Results are returned as
-    JSON fields, so newlines cannot forge extra "messages", and escape sequences or bidi
-    overrides cannot hide text from the person reviewing tool output.
+    JSON fields, so newlines cannot forge extra "messages". Removing escape sequences, bidi
+    overrides, tag characters and zero-width characters means a model cannot be handed
+    instructions that the person reviewing the tool output cannot see. Runs of joiners or
+    variation selectors (used to smuggle hidden data) are collapsed to one, which keeps
+    multi-part emoji (family, rainbow flag, heart on fire) intact.
     """
     if value is None:
         return None
     out = []
+    prev = ""
     for ch in str(value):
-        if ch in "\n\t":
-            out.append(ch)
-        elif ch in _BIDI_CONTROLS or unicodedata.category(ch) == "Cc":
+        cp = ord(ch)
+        if ch in "\u2028\u2029":
+            ch = "\n"
+        category = unicodedata.category(ch)
+        if ch not in "\n\t" and (
+            category in ("Cc", "Cs")
+            or (category == "Cf" and ch not in _JOINERS)
+            or ch in _INVISIBLE_LETTERS
+            or 0xE0100 <= cp <= 0xE01EF
+        ):
             continue
-        else:
-            out.append(ch)
+        kind = "joiner" if ch in _JOINERS else "selector" if 0xFE00 <= cp <= 0xFE0F else ""
+        if kind and kind == prev:
+            continue
+        out.append(ch)
+        prev = kind
     return "".join(out)
 
 
@@ -146,7 +164,7 @@ _MESSAGE_COLUMNS = """
 def _message_dict(row: Tuple, cursor: sqlite3.Cursor, names: Dict[str, str], is_context: bool = False) -> Dict[str, Any]:
     timestamp, sender, chat_name, content, is_from_me, chat_jid, msg_id, media_type = row
     message = {
-        "id": msg_id,
+        "id": clean_line(msg_id),
         "chat_jid": chat_jid,
         "chat_name": clean_line(chat_name),
         "timestamp": _iso(timestamp),
@@ -607,8 +625,11 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
             audio.convert_to_opus_ogg(str(path), converted)
         except Exception as e:
             return False, f"Error converting file to opus ogg. You likely need to install ffmpeg: {e}"
+        # The bridge also checks the original file against its own media policy.
         success, status, _ = _bridge_call(
-            "send", {"recipient": recipient.strip(), "media_path": converted}, MEDIA_REQUEST_TIMEOUT
+            "send",
+            {"recipient": recipient.strip(), "media_path": converted, "source_path": str(path)},
+            MEDIA_REQUEST_TIMEOUT,
         )
         return success, status
     finally:

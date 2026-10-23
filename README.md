@@ -18,9 +18,9 @@ Here's an example of what you can do when it's connected to Claude.
 
 This fork fixes the issues documented in [SECURITY_AUDIT.md](./SECURITY_AUDIT.md). The most important ones were an unauthenticated bridge API reachable from the network and from any website, arbitrary file upload, and a path traversal in media downloads. In short:
 
-- The bridge listens on `127.0.0.1` only, and every request needs a random API token (created in `whatsapp-bridge/store/api_token` on first run and read automatically by the MCP server). Browser and DNS-rebinding requests are refused.
+- The bridge listens on `127.0.0.1` only, and every request needs a random API token (regenerated in `whatsapp-bridge/store/api_token` each time the bridge starts and read automatically by the MCP server). Browser and DNS-rebinding requests are refused.
 - Files can only be sent from `whatsapp-bridge/store/outbox/` (or directories you add with `WHATSAPP_MEDIA_ALLOWED_DIRS`). Hidden files and the bridge's own secrets are always refused.
-- Downloads are written to `whatsapp-bridge/store/media/<chat>/<type>_<message id>.<ext>`; the sender's filename can no longer choose the path.
+- Downloads are written to `whatsapp-bridge/store/media/<chat>/<type>_<message id>_<hash>.<ext>`; the sender's filename can no longer choose the path, and unusual extensions are saved as `.bin`.
 - The store is private to your user (`0700`/`0600`), and message text is no longer written to logs.
 - Tools return JSON, strip control characters, and tell the model that message content is untrusted. Send tools are marked destructive so your MCP client can ask before each send.
 - Optional guardrails: a recipient allowlist, a read-only mode and a send rate limit (see [Configuration](#configuration)).
@@ -52,12 +52,12 @@ This fork fixes the issues documented in [SECURITY_AUDIT.md](./SECURITY_AUDIT.md
 
    ```bash
    cd whatsapp-bridge
-   go run main.go
+   go run .
    ```
 
    The first time you run it, you will be prompted to scan a QR code. Scan the QR code with your WhatsApp mobile app to authenticate.
 
-   On start-up the bridge creates `store/api_token`, `store/outbox/` and `store/media/`, and restricts the `store` directory to your user. The REST API is only available on `127.0.0.1:8080`.
+   On start-up the bridge creates `store/outbox/` and `store/media/`, writes a fresh API token to `store/api_token`, and restricts the `store` directory to your user. The REST API is only available on `127.0.0.1:8080`.
 
    After approximately 20 days, you will might need to re-authenticate.
 
@@ -85,7 +85,7 @@ This fork fixes the issues documented in [SECURITY_AUDIT.md](./SECURITY_AUDIT.md
    }
    ```
 
-   The MCP server enforces the allowlist and read-only mode itself. Set them for the bridge too (in the environment where you run `go run main.go`), so they hold even if something else gets hold of the API token.
+   The MCP server enforces the allowlist and read-only mode itself. Set them for the bridge too (in the environment where you run `go run .`), so they hold even if something else gets hold of the API token.
 
    For **Claude**, save this as `claude_desktop_config.json` in your Claude Desktop configuration directory at:
 
@@ -120,7 +120,7 @@ If you're running this project on Windows, be aware that `go-sqlite3` requires *
    ```bash
    cd whatsapp-bridge
    go env -w CGO_ENABLED=1
-   go run main.go
+   go run .
    ```
 
 Without this setup, you'll likely run into errors like:
@@ -129,7 +129,7 @@ Without this setup, you'll likely run into errors like:
 
 ## Configuration
 
-All settings are environment variables. Set bridge settings where you run `go run main.go`, and MCP server settings in the `env` block of your MCP client config. Where both are listed, set the same value in both places.
+All settings are environment variables. Set bridge settings where you run `go run .`, and MCP server settings in the `env` block of your MCP client config. Where both are listed, set the same value in both places.
 
 | Variable | Used by | Default | Purpose |
 |---|---|---|---|
