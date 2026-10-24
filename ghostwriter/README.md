@@ -72,9 +72,9 @@ These are optional. Set them in the same place as the bridge variables.
 |---|---|
 | `GHOSTWRITER_MODEL` | The Claude model used for drafts. Default `sonnet`. |
 | `CLAUDE_BIN` | The path of the `claude` program. Set it if the bridge cannot find `claude`. |
-| `GHOSTWRITER_PYTHON` | The path of a Python 3.11 or newer. Set it if the bridge starts from `launchd` or another place with a short `PATH`. |
+| `GHOSTWRITER_PYTHON` | The path of a Python 3.9 or newer. Set it if the bridge starts from `launchd` or another place with a short `PATH`. |
 | `GHOSTWRITER_HOME` | The folder for your voice, templates, facts and draft log. Default: a `ghostwriter` folder inside the bridge's `store` folder. |
-| `GHOSTWRITER_CLAUDE_TIMEOUT` | How many seconds the runner waits for the model. |
+| `GHOSTWRITER_CLAUDE_TIMEOUT` | How many seconds the runner waits for the model. Default 150. |
 
 ## Ask for a draft by hand
 
