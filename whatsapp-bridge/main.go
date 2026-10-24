@@ -110,6 +110,10 @@ func NewMessageStore(storeDir string) (*MessageStore, error) {
 	// (see SyncContacts). Older versions let history sync move a chat's
 	// last_message_time backwards, so repair it from the stored messages.
 	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS meta (
+			key TEXT PRIMARY KEY,
+			value TEXT
+		);
 		CREATE TABLE IF NOT EXISTS contacts (
 			jid TEXT PRIMARY KEY,
 			phone TEXT,
@@ -158,6 +162,12 @@ func addColumnIfMissing(db *sql.DB, table, column, columnType string) error {
 		return err
 	}
 	_, err = db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, columnType))
+	return err
+}
+
+// SetMeta stores a small piece of bridge state for the scripts that read messages.db
+func (store *MessageStore) SetMeta(key, value string) error {
+	_, err := store.db.Exec("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", key, value)
 	return err
 }
 
@@ -537,7 +547,7 @@ func extractMediaInfo(msg *waProto.Message) MediaInfo {
 }
 
 // Handle regular incoming messages with media support
-func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
+func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, drafts *drafter, msg *events.Message, logger waLog.Logger) {
 	// Save message to database
 	chatJID := msg.Info.Chat.String()
 	sender := msg.Info.Sender.User
@@ -564,6 +574,20 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 
 	// Store message in database
 	err = messageStore.StoreMessage(msg.Info.ID, chatJID, sender, content, msg.Info.Timestamp, msg.Info.IsFromMe, media)
+
+	// A customer message starts (or restarts) a draft timer; the owner's own message
+	// in that chat means she has answered, which cancels it
+	if drafts != nil {
+		if msg.Info.IsFromMe {
+			drafts.Outgoing(msg.Info.Chat)
+		} else {
+			text := content
+			if text == "" {
+				text = "[" + media.Type + "]"
+			}
+			drafts.Incoming(msg.Info.Chat, text, msg.Info.Timestamp)
+		}
+	}
 
 	if err != nil {
 		logger.Warnf("Failed to store message: %v", err)
@@ -775,14 +799,16 @@ type apiServer struct {
 	cfg     *Config
 	limiter *rateLimiter
 	lids    lidDirectory // nil when there is no client (tests)
+	drafts  *drafter     // nil unless WHATSAPP_DRAFTS is set
 }
 
-func newAPIHandler(client *whatsmeow.Client, messageStore *MessageStore, cfg *Config) http.Handler {
+func newAPIHandler(client *whatsmeow.Client, messageStore *MessageStore, cfg *Config, drafts *drafter) http.Handler {
 	s := &apiServer{
 		client:  client,
 		store:   messageStore,
 		cfg:     cfg,
 		limiter: newRateLimiter(cfg.SendRatePerMinute, time.Minute),
+		drafts:  drafts,
 	}
 	if client != nil {
 		s.lids = client.Store.LIDs
@@ -794,6 +820,7 @@ func (s *apiServer) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/send", s.protect(s.handleSend))
 	mux.HandleFunc("/api/download", s.protect(s.handleDownload))
+	mux.HandleFunc("/api/draft", s.protect(s.handleDraft))
 	return mux
 }
 
@@ -895,6 +922,42 @@ func (s *apiServer) handleSend(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, SendMessageResponse{Success: success, Message: message})
 }
 
+// DraftRequest asks for a draft reply for one chat right away (no quiet period)
+type DraftRequest struct {
+	ChatJID string `json:"chat_jid"`
+}
+
+// Handler for drafting a reply on demand. The draft goes to the account's own chat,
+// like automatic drafts; the response only says whether one was sent.
+func (s *apiServer) handleDraft(w http.ResponseWriter, r *http.Request) {
+	if s.drafts == nil {
+		writeError(w, http.StatusConflict, "drafts are not enabled (set WHATSAPP_DRAFTS=1 and WHATSAPP_DRAFT_COMMAND)")
+		return
+	}
+	var req DraftRequest
+	if err := decodeJSONBody(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request format")
+		return
+	}
+	chat, err := parseRecipient(req.ChatJID)
+	if err != nil || !isIndividualServer(chat.Server) || s.drafts.isSelf(chat) {
+		writeError(w, http.StatusBadRequest, "chat_jid must be a one-to-one chat with someone else")
+		return
+	}
+
+	sent, err := s.drafts.Draft(r.Context(), chat, "", true)
+	switch {
+	case errors.Is(err, errDraftRateLimited):
+		writeError(w, http.StatusTooManyRequests, err.Error())
+	case err != nil:
+		writeError(w, http.StatusBadGateway, oneLine(err.Error(), 300))
+	case sent:
+		writeJSON(w, http.StatusOK, map[string]any{"success": true, "message": "draft sent to your own chat"})
+	default:
+		writeJSON(w, http.StatusOK, map[string]any{"success": true, "message": "no reply needed"})
+	}
+}
+
 // recipientAllowed checks the allowlist. A person has both a phone-number JID and a
 // LID, and chats now mostly use the LID, so an allowlisted phone number also allows
 // that person's LID (and the other way round), using WhatsApp's own mapping.
@@ -957,7 +1020,7 @@ func (s *apiServer) handleDownload(w http.ResponseWriter, r *http.Request) {
 
 // Start a REST API server to expose the WhatsApp client functionality. It only
 // listens on loopback and every request must carry the API token.
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *Config) (*http.Server, error) {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *Config, drafts *drafter) (*http.Server, error) {
 	ln, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
 		return nil, err
@@ -968,7 +1031,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *
 	}
 
 	server := &http.Server{
-		Handler:           newAPIHandler(client, messageStore, cfg),
+		Handler:           newAPIHandler(client, messageStore, cfg, drafts),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      10 * time.Minute, // uploads of large media happen inside the request
@@ -1058,12 +1121,23 @@ func main() {
 	}
 	defer messageStore.Close()
 
+	// Draft replies run an external command and send only to the account itself
+	var drafts *drafter
+	if cfg.Drafts {
+		storeDir, err := filepath.Abs(cfg.StoreDir)
+		if err != nil {
+			logger.Errorf("Failed to resolve store directory: %v", err)
+			return
+		}
+		drafts = newDrafter(cfg, client, commandDraftRunner(cfg.DraftCommand, storeDir))
+	}
+
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
 		case *events.Message:
 			// Process regular messages
-			handleMessage(client, messageStore, v, logger)
+			handleMessage(client, messageStore, drafts, v, logger)
 
 		case *events.HistorySync:
 			// Process history sync events
@@ -1138,6 +1212,16 @@ func main() {
 
 	fmt.Println("\n✓ Connected to WhatsApp!")
 	syncContacts(client, messageStore, logger)
+	// The account's own JIDs let the drafting scripts leave out the "Message yourself" chat
+	if own := client.Store.ID; own != nil {
+		messageStore.SetMeta("own_jid", own.ToNonAD().String())
+	}
+	if !client.Store.LID.IsEmpty() {
+		messageStore.SetMeta("own_lid", client.Store.LID.ToNonAD().String())
+	}
+	if drafts != nil {
+		fmt.Printf("Draft replies: on. A draft is written %s after a customer's last message and sent only to your own chat.\n", cfg.DraftDelay)
+	}
 	if cfg.ReadOnly {
 		fmt.Println("Read-only mode: sending messages is disabled.")
 	} else if len(cfg.AllowedRecipients) == 0 && !cfg.AllowAnyRecipient {
@@ -1147,7 +1231,7 @@ func main() {
 	}
 
 	// Start REST API server
-	server, err := startRESTServer(client, messageStore, cfg)
+	server, err := startRESTServer(client, messageStore, cfg, drafts)
 	if err != nil {
 		logger.Errorf("Failed to start REST API server: %v", err)
 		return

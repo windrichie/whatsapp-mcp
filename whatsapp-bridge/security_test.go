@@ -269,7 +269,7 @@ func doAPI(t *testing.T, h http.Handler, c apiCase) (*httptest.ResponseRecorder,
 
 func TestAPIRequestGuards(t *testing.T) {
 	cfg := testConfig(t)
-	h := newAPIHandler(nil, testStore(t, cfg), cfg)
+	h := newAPIHandler(nil, testStore(t, cfg), cfg, nil)
 	inOutbox := writeFile(t, filepath.Join(cfg.OutboxDir, "photo.jpg"), "jpeg")
 	secret := filepath.Join(cfg.StoreDir, "whatsapp.db")
 	valid := `{"recipient":"447700900123","message":"hi"}`
@@ -322,7 +322,7 @@ func TestAPIAllowlistReadOnlyAndRateLimit(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.AllowedRecipients = map[string]bool{"447700900123@s.whatsapp.net": true}
 	cfg.SendRatePerMinute = 2
-	h := newAPIHandler(nil, testStore(t, cfg), cfg)
+	h := newAPIHandler(nil, testStore(t, cfg), cfg, nil)
 
 	if rec, _ := doAPI(t, h, apiCase{body: `{"recipient":"447700900999","message":"hi"}`}); rec.Code != 403 {
 		t.Errorf("non-allowlisted recipient: status %d", rec.Code)
@@ -345,7 +345,7 @@ func TestAPIAllowlistReadOnlyAndRateLimit(t *testing.T) {
 func TestAPISendingNeedsAllowlistOrOptIn(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.AllowAnyRecipient = false
-	h := newAPIHandler(nil, testStore(t, cfg), cfg)
+	h := newAPIHandler(nil, testStore(t, cfg), cfg, nil)
 	rec, out := doAPI(t, h, apiCase{body: `{"recipient":"447700900123","message":"hi"}`})
 	if rec.Code != 403 || !strings.Contains(out["message"].(string), "WHATSAPP_ALLOWED_RECIPIENTS") {
 		t.Errorf("no allowlist: status %d (%s)", rec.Code, rec.Body.String())
@@ -358,7 +358,7 @@ func TestAPISendingNeedsAllowlistOrOptIn(t *testing.T) {
 
 func TestAPIRefusesHardLinkedFiles(t *testing.T) {
 	cfg := testConfig(t)
-	h := newAPIHandler(nil, testStore(t, cfg), cfg)
+	h := newAPIHandler(nil, testStore(t, cfg), cfg, nil)
 	secret := writeFile(t, filepath.Join(t.TempDir(), "id_ed25519"), "key")
 	linked := filepath.Join(cfg.OutboxDir, "innocent.txt")
 	if err := os.Link(secret, linked); err != nil {
@@ -733,7 +733,7 @@ func TestNoBrowserCanReachAPI(t *testing.T) {
 	// A browser page can only send "simple" cross-origin requests without a preflight:
 	// no Authorization header and a text/plain, form or multipart body. All are refused.
 	cfg := testConfig(t)
-	srv := httptest.NewServer(newAPIHandler(nil, testStore(t, cfg), cfg))
+	srv := httptest.NewServer(newAPIHandler(nil, testStore(t, cfg), cfg, nil))
 	defer srv.Close()
 	body := bytes.NewBufferString(`{"recipient":"447700900123","message":"hi"}`)
 	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/send", body)

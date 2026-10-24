@@ -49,6 +49,14 @@ type Config struct {
 	ReadOnly          bool
 	MaxMediaBytes     int64
 	SendRatePerMinute int
+
+	// Draft replies, sent only to the account's own chat (see drafts.go)
+	Drafts         bool
+	DraftCommand   string
+	DraftDelay     time.Duration
+	DraftsPerHour  int
+	DraftChats     map[string]bool // empty means every individual chat
+	DraftSkipChats map[string]bool
 }
 
 func envBool(name string) bool {
@@ -135,7 +143,55 @@ func loadConfig() (*Config, error) {
 		cfg.AllowedRecipients[jid.String()] = true
 	}
 
+	if err := cfg.loadDraftConfig(); err != nil {
+		return nil, err
+	}
 	return cfg, nil
+}
+
+func (c *Config) loadDraftConfig() error {
+	c.Drafts = envBool("WHATSAPP_DRAFTS")
+	c.DraftDelay = defaultDraftDelay
+	c.DraftsPerHour = defaultDraftsPerHour
+	c.DraftChats, c.DraftSkipChats = map[string]bool{}, map[string]bool{}
+	if !c.Drafts {
+		return nil
+	}
+
+	c.DraftCommand = strings.TrimSpace(os.Getenv("WHATSAPP_DRAFT_COMMAND"))
+	if !filepath.IsAbs(c.DraftCommand) {
+		return errors.New("WHATSAPP_DRAFTS needs WHATSAPP_DRAFT_COMMAND set to the absolute path of the draft command")
+	}
+	if fi, err := os.Stat(c.DraftCommand); err != nil || !fi.Mode().IsRegular() || fi.Mode().Perm()&0o111 == 0 {
+		return fmt.Errorf("WHATSAPP_DRAFT_COMMAND %q is not an executable file", c.DraftCommand)
+	}
+	if v := strings.TrimSpace(os.Getenv("WHATSAPP_DRAFT_DELAY_SECONDS")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 5 || n > 3600 {
+			return errors.New("WHATSAPP_DRAFT_DELAY_SECONDS must be between 5 and 3600")
+		}
+		c.DraftDelay = time.Duration(n) * time.Second
+	}
+	if v := strings.TrimSpace(os.Getenv("WHATSAPP_DRAFTS_PER_HOUR")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 1000 {
+			return errors.New("WHATSAPP_DRAFTS_PER_HOUR must be between 1 and 1000")
+		}
+		c.DraftsPerHour = n
+	}
+	for name, set := range map[string]map[string]bool{"WHATSAPP_DRAFT_CHATS": c.DraftChats, "WHATSAPP_DRAFT_SKIP_CHATS": c.DraftSkipChats} {
+		for _, entry := range strings.Split(os.Getenv(name), ",") {
+			if entry = strings.TrimSpace(entry); entry == "" {
+				continue
+			}
+			jid, err := parseRecipient(entry)
+			if err != nil || !isIndividualServer(jid.Server) {
+				return fmt.Errorf("invalid %s entry %q: drafts are only for one-to-one chats (phone number or ...@lid)", name, entry)
+			}
+			set[jid.String()] = true
+		}
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
