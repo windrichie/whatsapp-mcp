@@ -165,6 +165,12 @@ func addColumnIfMissing(db *sql.DB, table, column, columnType string) error {
 	return err
 }
 
+// HasChat reports whether a chat with this JID has been stored
+func (store *MessageStore) HasChat(jid string) bool {
+	var one int
+	return store.db.QueryRow("SELECT 1 FROM chats WHERE jid = ?", jid).Scan(&one) == nil
+}
+
 // SetMeta stores a small piece of bridge state for the scripts that read messages.db
 func (store *MessageStore) SetMeta(key, value string) error {
 	_, err := store.db.Exec("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", key, value)
@@ -943,6 +949,13 @@ func (s *apiServer) handleDraft(w http.ResponseWriter, r *http.Request) {
 	if err != nil || !isIndividualServer(chat.Server) || s.drafts.isSelf(chat) {
 		writeError(w, http.StatusBadRequest, "chat_jid must be a one-to-one chat with someone else")
 		return
+	}
+
+	// A phone number names the person, but most chats are stored under the person's LID
+	if chat.Server == types.DefaultUserServer && s.lids != nil && !s.store.HasChat(chat.String()) {
+		if lid, err := s.lids.GetLIDForPN(r.Context(), chat); err == nil && !lid.IsEmpty() {
+			chat = lid.ToNonAD()
+		}
 	}
 
 	sent, err := s.drafts.Draft(r.Context(), chat, "", true)

@@ -25,6 +25,7 @@ type draftHarness struct {
 	runs   atomic.Int32
 	mu     sync.Mutex
 	sent   []string
+	chats  []types.JID // chats the draft command was run for
 	result draftResult
 	runErr error
 	gate   chan struct{} // when set, run waits for it
@@ -46,6 +47,9 @@ func newDraftHarness(t *testing.T, delay time.Duration) *draftHarness {
 		describe: resolver.name,
 		run: func(ctx context.Context, chat types.JID) (draftResult, error) {
 			h.runs.Add(1)
+			h.mu.Lock()
+			h.chats = append(h.chats, chat)
+			h.mu.Unlock()
 			if h.gate != nil {
 				<-h.gate
 			}
@@ -302,5 +306,29 @@ func TestAPIDraft(t *testing.T) {
 	h.limiter.Allow(time.Now())
 	if rec, _ := doAPI(t, api, apiCase{path: "/api/draft", body: `{"chat_jid":"` + aliceLID.String() + `"}`}); rec.Code != 429 {
 		t.Errorf("rate limited: status %d", rec.Code)
+	}
+}
+
+func TestAPIDraftByPhoneNumberUsesTheLIDChat(t *testing.T) {
+	cfg := testConfig(t)
+	store := testStore(t, cfg)
+	store.StoreChat(aliceLID.String(), "Alice Tan", time.Now()) // stored under the LID only
+	store.StoreChat(bobPN.String(), "Bob", time.Now())          // an older chat stored under the phone number
+	h := newDraftHarness(t, time.Hour)
+	s := &apiServer{store: store, cfg: cfg, limiter: newRateLimiter(1000, time.Minute), lids: testResolver().lids, drafts: h.drafter}
+	api := s.routes()
+	for _, phone := range []string{alicePN.User, bobPN.User, strangerPN.User} {
+		if rec, _ := doAPI(t, api, apiCase{path: "/api/draft", body: `{"chat_jid":"` + phone + `"}`}); rec.Code != 200 {
+			t.Fatalf("%s: status %d (%s)", phone, rec.Code, rec.Body.String())
+		}
+	}
+	want := []types.JID{aliceLID, bobPN, strangerLD} // LID when the phone-number chat doesn't exist
+	if len(h.chats) != len(want) {
+		t.Fatalf("draft command ran for %v, want %v", h.chats, want)
+	}
+	for i := range want {
+		if h.chats[i] != want[i] {
+			t.Errorf("draft %d ran for %s, want %s", i, h.chats[i], want[i])
+		}
 	}
 }

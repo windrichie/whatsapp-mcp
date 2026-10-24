@@ -5,3 +5,4 @@ whatsapp.log
 whatsapp-bridge/store/
 # Binary from `go build` in whatsapp-bridge/
 whatsapp-bridge/whatsapp-client
+__pycache__/
