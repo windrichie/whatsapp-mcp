@@ -471,9 +471,10 @@ for Windows.
   - a full MCP stdio round-trip checking instructions, tool annotations and structured
     output;
   - read-only mode hiding the send tools.
-- **`whatsapp-bridge/contacts_test.go`** (8 tests) covers:
+- **`whatsapp-bridge/contacts_test.go`** (9 tests) covers:
   - LID-to-address-book naming, with push names ignored;
   - the contacts table sync and the renaming of placeholder chat names;
+  - real names that survive an empty contact store after linking again;
   - chat times that never move backwards (compared as instants across time zones),
     and the startup repair;
   - the newest-message time in history sync and the group sender taken from the

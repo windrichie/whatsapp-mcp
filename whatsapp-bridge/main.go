@@ -172,7 +172,13 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 	_, err := store.db.Exec(
 		`INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)
 		ON CONFLICT(jid) DO UPDATE SET
-			name = COALESCE(NULLIF(excluded.name, ''), chats.name),
+			name = CASE
+				WHEN excluded.name IS NULL OR excluded.name = '' THEN chats.name
+				-- A bare number is a fallback (the contact store may still be empty after
+				-- linking again); never let it replace a real name
+				WHEN excluded.name NOT GLOB '*[^0-9]*' AND chats.name GLOB '*[^0-9]*' THEN chats.name
+				ELSE excluded.name
+			END,
 			last_message_time = CASE
 				WHEN chats.last_message_time IS NULL
 					OR julianday(excluded.last_message_time) > julianday(chats.last_message_time)

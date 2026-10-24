@@ -166,6 +166,38 @@ func TestSyncContactsFillsTableAndRenamesChats(t *testing.T) {
 	}
 }
 
+func TestRealNamesSurviveAnEmptyContactStore(t *testing.T) {
+	cfg := testConfig(t)
+	store := testStore(t, cfg)
+	store.StoreChat(aliceLID.String(), "Alice Tan", time.Now())
+	chatName := func() string {
+		var name string
+		store.db.QueryRow("SELECT name FROM chats WHERE jid = ?", aliceLID.String()).Scan(&name)
+		return name
+	}
+
+	// Right after linking again: no contacts and no LID mappings yet
+	empty := contactResolver{contacts: fakeContacts{}, lids: fakeLIDs{}}
+	if renamed, err := store.SyncContacts(context.Background(), empty); err != nil || renamed != 0 {
+		t.Errorf("SyncContacts with an empty store renamed %d chats (%v)", renamed, err)
+	}
+	// A live message in the meantime names the chat by its number
+	store.StoreChat(aliceLID.String(), empty.name(context.Background(), aliceLID), time.Now())
+	if got := chatName(); got != "Alice Tan" {
+		t.Errorf("real name replaced by a number: %q", got)
+	}
+
+	// Once the address book arrives, a better name still replaces the old one
+	renamedContacts := testResolver()
+	renamedContacts.contacts.(fakeContacts)[alicePN] = types.ContactInfo{Found: true, FullName: "Alice T."}
+	if _, err := store.SyncContacts(context.Background(), renamedContacts); err != nil {
+		t.Fatal(err)
+	}
+	if got := chatName(); got != "Alice T." {
+		t.Errorf("address-book rename not applied: %q", got)
+	}
+}
+
 func chatTime(t *testing.T, store *MessageStore, jid string) time.Time {
 	t.Helper()
 	var ts time.Time

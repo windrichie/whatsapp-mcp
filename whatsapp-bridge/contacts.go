@@ -159,7 +159,13 @@ func (store *MessageStore) SyncContacts(ctx context.Context, r contactResolver) 
 
 	renamed := 0
 	for jid, old := range chatNames {
-		if name := r.name(ctx, jid); name != "" && name != old {
+		name := r.name(ctx, jid)
+		// A number is only a fallback: right after linking again the contact store is
+		// empty, and a real name saved earlier must survive until it fills up
+		if isNumber(name) && !isNumber(old) && old != "" {
+			continue
+		}
+		if name != "" && name != old {
 			if _, err := tx.ExecContext(ctx, "UPDATE chats SET name = ? WHERE jid = ?", name, jid.String()); err != nil {
 				return 0, err
 			}
@@ -167,6 +173,20 @@ func (store *MessageStore) SyncContacts(ctx context.Context, r contactResolver) 
 		}
 	}
 	return renamed, tx.Commit()
+}
+
+// isNumber reports whether s is a non-empty string of digits, such as a phone number or
+// LID used as a fallback name.
+func isNumber(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func nullIfEmpty(s string) any {
