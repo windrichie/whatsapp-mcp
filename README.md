@@ -154,6 +154,14 @@ All settings are environment variables. Set bridge settings where you run `go ru
 - New downloads go to `store/media/`. Files downloaded by the old version stay in `store/<chat jid>/`.
 - Tool results are now JSON objects instead of preformatted text.
 
+## Draft replies for customers (Ghostwriter)
+
+The [`ghostwriter/`](./ghostwriter) folder is a Claude Code plugin, `solopreneur-ghostwriter`. It drafts replies to customers in the owner's own voice. When a customer writes and then goes quiet, the bridge asks for a draft and sends it to the owner's own "Message yourself" chat. She copies it into the customer's chat and sends it herself.
+
+- It is off unless you set `WHATSAPP_DRAFTS=1` and `WHATSAPP_DRAFT_COMMAND`. Keep `WHATSAPP_READ_ONLY=1`: drafts use their own path, which can only send to the account itself.
+- The AI that writes a draft has no tools. It gets the chat, the owner's voice guide, templates and facts as text, and returns text.
+- Learn the voice and templates from past messages with the plugin's skills. Setup and settings are in [ghostwriter/README.md](./ghostwriter/README.md).
+
 ## Architecture Overview
 
 This application consists of two main components:

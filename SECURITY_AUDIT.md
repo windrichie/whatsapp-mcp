@@ -441,6 +441,19 @@ Note: `GOOS=windows go vet` still fails on the test file, because the FIFO test 
 `syscall.Mkfifo`. That was already the case before this review. The bridge itself builds
 for Windows.
 
+## Draft replies (Ghostwriter)
+
+The bridge gained one new sending path, for draft replies. It was built to keep the read-only model intact:
+
+- **It sends only to the account itself.** The draft sender has no recipient parameter: it always sends to the account's own JID. It works while `WHATSAPP_READ_ONLY=1` blocks the send API, and it is off unless `WHATSAPP_DRAFTS=1`.
+- **The AI has no tools.** The bridge runs `WHATSAPP_DRAFT_COMMAND <chat_jid>` (an absolute, executable path). The bundled runner reads the store read-only and calls `claude -p --restricted --strict-mcp-config --tools ""` with a replaced system prompt, so a prompt-injected customer message can at worst produce a bad draft that the owner reads.
+- **Untrusted text is contained.** Customer text is cleaned of hidden characters. The prompt's own tags are neutralised in it, and continuation lines are indented, so a customer cannot forge an "Owner:" turn or close a section. The drafting rules forbid inventing prices, dates or policies; missing facts become `[CHECK: …]` placeholders.
+- **Limits:**
+  - one draft at a time, at most `WHATSAPP_DRAFTS_PER_HOUR` (default 30);
+  - only one-to-one chats, and only messages less than 24 hours old;
+  - the command and its children are killed after 3 minutes, and stdout must be exactly one `{"reply","note"}` JSON object of at most 64 KiB.
+- **Residual risk:** each draft sends that chat's recent messages and the owner's data files to Claude. Messages to yourself do not trigger a phone notification, so the owner has to check the chat.
+
 ## Test coverage added
 
 - **`whatsapp-bridge/security_test.go`** (24 tests + fuzz target) covers:
