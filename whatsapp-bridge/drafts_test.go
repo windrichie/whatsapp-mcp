@@ -221,6 +221,7 @@ func TestCommandDraftRunner(t *testing.T) {
 		"unknown field": `echo '{"reply":"x","note":"","send_to":"someone"}'`,
 		"failure":       `echo boom >&2; exit 3`,
 		"too much":      `head -c 70000 /dev/zero | tr '\0' 'a'`,
+		"two objects":   `echo '{"reply":"a","note":""} {"reply":"b","note":""}'`,
 	} {
 		if _, err := commandDraftRunner(writeScript(t, body), store)(ctx, aliceLID); err == nil {
 			t.Errorf("%s: no error", name)

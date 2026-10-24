@@ -295,6 +295,8 @@ func commandDraftRunner(command, storeDir string) func(context.Context, types.JI
 		cmd := exec.CommandContext(ctx, command, chat.String())
 		cmd.Env = append(os.Environ(), "WHATSAPP_STORE_DIR="+storeDir, "GHOSTWRITER_CHAT_JID="+chat.String())
 		configureProcessGroup(cmd)
+		// Don't wait forever for output pipes that a leftover child keeps open
+		cmd.WaitDelay = 5 * time.Second
 		stdout := &cappedBuffer{limit: maxDraftOutputBytes}
 		stderr := &cappedBuffer{limit: 4 << 10}
 		cmd.Stdout, cmd.Stderr = stdout, stderr
@@ -312,6 +314,9 @@ func commandDraftRunner(command, storeDir string) func(context.Context, types.JI
 		dec.DisallowUnknownFields()
 		if err := dec.Decode(&res); err != nil {
 			return draftResult{}, fmt.Errorf("draft command printed invalid JSON: %v", err)
+		}
+		if dec.More() {
+			return draftResult{}, errors.New("draft command printed more than one JSON object")
 		}
 		return res, nil
 	}

@@ -52,9 +52,20 @@ def test_database_is_read_only_and_data_dir_is_private(store):
     assert stat.S_IMODE(home.stat().st_mode) == 0o700
 
 
+def test_invalid_utf8_is_replaced_not_raised(store):
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute("INSERT INTO chats VALUES (?, 'x', '2025-01-02 09:00:00+08:00')", (ALICE,))
+        conn.execute(
+            "INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me) VALUES ('M1', ?, 's', CAST(X'6869FF' AS TEXT), '2025-01-02 09:00:00+08:00', 0)",
+            (ALICE,),
+        )
+    with gw_store.connect() as conn:
+        assert gw_store.chat_messages(conn, ALICE)[0].content == "hi\ufffd"
+
+
 def test_chat_jid_validation():
     assert gw_store.validate_chat_jid(ALICE) == ALICE
-    for bad in [GROUP, "status@broadcast", "../x@lid", "6591234567", "", "1@lid; rm -rf /"]:
+    for bad in [GROUP, "status@broadcast", "../x@lid", "6591234567", "", "1@lid; rm -rf /", ALICE + "\n"]:
         with pytest.raises(ValueError):
             gw_store.validate_chat_jid(bad)
 
