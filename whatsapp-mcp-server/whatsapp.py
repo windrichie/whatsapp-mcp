@@ -46,6 +46,10 @@ class BridgeError(Exception):
     """The WhatsApp bridge could not be reached or rejected the request."""
 
 
+def env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 # ---------------------------------------------------------------------------
 # Untrusted text
 # ---------------------------------------------------------------------------
@@ -497,6 +501,13 @@ def _allowed_media_dirs() -> List[Path]:
             continue
         if not os.path.isabs(entry):
             raise ValueError(f"WHATSAPP_MEDIA_ALLOWED_DIRS entries must be absolute paths (got {entry!r})")
+        # Only dot-files are refused inside an allowed directory, so allowing the home
+        # directory would expose ~/Library (keychains, browser cookies) and similar.
+        if _is_same_or_ancestor(Path(entry), Path.home()):
+            raise ValueError(
+                f"WHATSAPP_MEDIA_ALLOWED_DIRS must not contain your home directory or one of its parents "
+                f"(got {entry!r}); list specific folders instead"
+            )
         dirs.append(Path(entry))
     return dirs
 
@@ -514,6 +525,16 @@ def _matching_ancestor(path: Path, directory: Path) -> Optional[Path]:
         except OSError:
             continue
     return None
+
+
+def _is_same_or_ancestor(directory: Path, path: Path) -> bool:
+    """Whether directory is path itself or one of its parents."""
+    try:
+        if os.path.samefile(directory, path):
+            return True
+    except OSError:
+        pass
+    return _matching_ancestor(path, directory) is not None
 
 
 def validate_media_path(media_path: str) -> Path:
@@ -545,6 +566,10 @@ def validate_media_path(media_path: str) -> Path:
         raise ValueError("Refusing to send files from the bridge's private store directory")
     if not resolved.is_file():
         raise ValueError("media_path must be a regular file")
+    # The path checks cannot see a file's other names, so a hard link in the outbox
+    # could point at ~/.ssh/id_ed25519.
+    if resolved.stat().st_nlink != 1:
+        raise ValueError("Refusing to send a file that has more than one hard link; send a copy instead")
     if resolved.stat().st_size > MAX_MEDIA_BYTES:
         raise ValueError(f"Media file is larger than the {MAX_MEDIA_BYTES >> 20} MB limit")
     return resolved
@@ -570,8 +595,15 @@ def _check_recipient(recipient: str) -> Optional[str]:
     if len(recipient) > 64:
         return "Recipient is too long"
     allowed = _allowed_recipients()
-    if allowed and _normalize_recipient(recipient) not in allowed:
-        return "Recipient is not listed in WHATSAPP_ALLOWED_RECIPIENTS"
+    if allowed:
+        if _normalize_recipient(recipient) not in allowed:
+            return "Recipient is not listed in WHATSAPP_ALLOWED_RECIPIENTS"
+    elif not env_flag("WHATSAPP_ALLOW_ANY_RECIPIENT"):
+        # Without an allowlist, a prompt-injected agent could send to anyone.
+        return (
+            "Sending is disabled until WHATSAPP_ALLOWED_RECIPIENTS is set "
+            "(or WHATSAPP_ALLOW_ANY_RECIPIENT=1) for the MCP server and the bridge"
+        )
     return None
 
 

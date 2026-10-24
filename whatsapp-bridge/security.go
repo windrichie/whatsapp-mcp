@@ -44,7 +44,8 @@ type Config struct {
 	ListenAddr        string
 	APIToken          string
 	AllowedMediaDirs  []string
-	AllowedRecipients map[string]bool // empty means any valid individual or group recipient
+	AllowedRecipients map[string]bool // empty means sending is refused unless AllowAnyRecipient
+	AllowAnyRecipient bool            // explicit opt-in to sending without an allowlist
 	ReadOnly          bool
 	MaxMediaBytes     int64
 	SendRatePerMinute int
@@ -71,6 +72,7 @@ func loadConfig() (*Config, error) {
 		OutboxDir:         filepath.Join(storeDir, "outbox"),
 		ListenAddr:        defaultListenAddr,
 		ReadOnly:          envBool("WHATSAPP_READ_ONLY"),
+		AllowAnyRecipient: envBool("WHATSAPP_ALLOW_ANY_RECIPIENT"),
 		MaxMediaBytes:     defaultMaxMediaMB << 20,
 		SendRatePerMinute: defaultSendRatePerMin,
 		AllowedRecipients: map[string]bool{},
@@ -103,6 +105,7 @@ func loadConfig() (*Config, error) {
 		cfg.SendRatePerMinute = n
 	}
 
+	home, _ := os.UserHomeDir()
 	cfg.AllowedMediaDirs = []string{cfg.OutboxDir}
 	for _, dir := range filepath.SplitList(os.Getenv("WHATSAPP_MEDIA_ALLOWED_DIRS")) {
 		dir = strings.TrimSpace(dir)
@@ -111,6 +114,11 @@ func loadConfig() (*Config, error) {
 		}
 		if !filepath.IsAbs(dir) {
 			return nil, fmt.Errorf("WHATSAPP_MEDIA_ALLOWED_DIRS entries must be absolute paths (got %q)", dir)
+		}
+		// Only dot-files are refused inside an allowed directory, so allowing the home
+		// directory would expose ~/Library (keychains, browser cookies) and similar.
+		if home != "" && isSameOrAncestorDir(dir, home) {
+			return nil, fmt.Errorf("WHATSAPP_MEDIA_ALLOWED_DIRS must not contain your home directory or one of its parents (got %q); list specific folders instead", dir)
 		}
 		cfg.AllowedMediaDirs = append(cfg.AllowedMediaDirs, filepath.Clean(dir))
 	}
@@ -403,6 +411,17 @@ func matchingAncestor(path, dir string) (string, bool) {
 	}
 }
 
+// isSameOrAncestorDir reports whether dir is path itself or one of its parents.
+func isSameOrAncestorDir(dir, path string) bool {
+	if dirInfo, err := os.Stat(dir); err == nil {
+		if pathInfo, err := os.Stat(path); err == nil && os.SameFile(dirInfo, pathInfo) {
+			return true
+		}
+	}
+	_, ok := matchingAncestor(path, dir)
+	return ok
+}
+
 // resolveSendablePath decides whether a local file may be uploaded to WhatsApp.
 // The file must live under an allowed directory, must not be hidden or inside a hidden
 // directory (.ssh, .aws, .env, ...), and must not come from the bridge's private store.
@@ -449,28 +468,44 @@ func (c *Config) resolveSendablePath(p string) (string, error) {
 	return resolved, nil
 }
 
-// readMediaFile reads a regular file of at most maxBytes. Devices, FIFOs and
+// openSendableFile opens a regular file that may be uploaded. Devices, FIFOs and
 // directories are rejected before opening so they cannot block or exhaust memory.
-func readMediaFile(path string, maxBytes int64) ([]byte, error) {
+// A file with more than one hard link is refused: the path checks cannot see the
+// other names, so a link in the outbox could point at ~/.ssh/id_ed25519.
+func openSendableFile(path string) (*os.File, os.FileInfo, error) {
 	before, err := os.Stat(path)
 	if err != nil {
-		return nil, errors.New("media file not found or not accessible")
+		return nil, nil, errors.New("media file not found or not accessible")
 	}
 	if !before.Mode().IsRegular() {
-		return nil, errors.New("media_path must be a regular file")
-	}
-	if before.Size() > maxBytes {
-		return nil, fmt.Errorf("media file is larger than the %d MB limit", maxBytes>>20)
+		return nil, nil, errors.New("media_path must be a regular file")
 	}
 
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, errors.New("media file not found or not accessible")
+		return nil, nil, errors.New("media file not found or not accessible")
 	}
-	defer f.Close()
 	after, err := f.Stat()
 	if err != nil || !after.Mode().IsRegular() || !os.SameFile(before, after) {
-		return nil, errors.New("media file changed while it was being opened")
+		f.Close()
+		return nil, nil, errors.New("media file changed while it was being opened")
+	}
+	if links, err := hardLinkCount(f); err != nil || links != 1 {
+		f.Close()
+		return nil, nil, errors.New("refusing to send a file that has more than one hard link; send a copy instead")
+	}
+	return f, after, nil
+}
+
+// readMediaFile reads a sendable file of at most maxBytes.
+func readMediaFile(path string, maxBytes int64) ([]byte, error) {
+	f, info, err := openSendableFile(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	if info.Size() > maxBytes {
+		return nil, fmt.Errorf("media file is larger than the %d MB limit", maxBytes>>20)
 	}
 
 	data, err := io.ReadAll(io.LimitReader(f, maxBytes+1))

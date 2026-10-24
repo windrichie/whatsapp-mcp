@@ -355,11 +355,12 @@ file after sending.
 
 ## Residual risk: what this fork does **not** solve
 
-- **Prompt injection is still possible.** With sending enabled and no
-  `WHATSAPP_ALLOWED_RECIPIENTS`, a successful injection can still make the agent send text
-  (for example, a summary of your chats) to any individual or group, up to the rate limit.
-  For real protection, set an allowlist or run read-only, and **keep per-call tool
-  approval on in your MCP client**. Don't choose "always allow" for `send_*`.
+- **Prompt injection is still possible.** Sending is refused until an allowlist is set,
+  but a successful injection can still make the agent send text (for example, a summary of
+  your chats) to anyone on that allowlist, or to anyone at all if you set
+  `WHATSAPP_ALLOW_ANY_RECIPIENT=1`, up to the rate limit. Keep the allowlist short or run
+  read-only, and **keep per-call tool approval on in your MCP client**. Don't choose
+  "always allow" for `send_*`.
 - **Same-user malware is out of scope.** Anything running as your user can read the store
   regardless of file permissions.
 - **Windows file modes.** POSIX permissions (`0600`/`0700`) are not enforced on Windows;
@@ -399,29 +400,49 @@ It did find the following, all now fixed:
 | Low (regression) | 128 KiB body cap rejected long non-ASCII messages after JSON escaping | Raised to 256 KiB |
 | Low (regression) | `.wma` audio was rejected by the ffmpeg format whitelist | Added `asf` and `au` |
 
+## Third review follow-up
+
+A third review found no bypass of the controls above. It confirmed that whatsmeow fetches
+media only through direct paths on WhatsApp's own hosts, using the size-capped client, and
+that no secrets are in the git history. It found these, now fixed:
+
+| Severity | Issue | Fix |
+|---|---|---|
+| Medium | Sending to any recipient was on by default, so one successful prompt injection could send chat contents to an attacker | Both the bridge and the MCP server refuse to send until `WHATSAPP_ALLOWED_RECIPIENTS` is set. Sending to anyone needs an explicit `WHATSAPP_ALLOW_ANY_RECIPIENT=1` |
+| Low | Go 1.27.2 has GO-2026-6809 (`crypto/x509`), which govulncheck reports as reachable; `go.mod` named no toolchain, so CI used Go 1.26.0 | `toolchain go1.27.3` in `go.mod` (Go downloads it automatically); CI uses a `setup-go` that reads it |
+| Low | Group names are chosen by group members, so a group can copy a contact's name and receive a message meant for that contact | Server instructions and the `send_message` description tell the model to use JIDs from `search_contacts` and to ask when a name matches more than one chat |
+| Low | A hard link inside an allowed directory passed the path checks, because they see only that one name (for example a link in the outbox to `~/.ssh/id_ed25519`) | Files with more than one hard link are refused, on the open file handle in the bridge and in the MCP server |
+| Low | `WHATSAPP_MEDIA_ALLOWED_DIRS` blocked only dot-files, so allowing the home directory exposed `~/Library` (keychains, browser cookies) | The home directory and its parents are refused as allowed directories |
+| Info | CI ran `govulncheck@latest` and actions by moving tags | Actions are pinned to commit SHAs and govulncheck to v1.9.0 |
+
+Note: `GOOS=windows go vet` still fails on the test file, because the FIFO test calls
+`syscall.Mkfifo`. That was already the case before this review. The bridge itself builds
+for Windows.
+
 ## Test coverage added
 
-- **`whatsapp-bridge/security_test.go`** (21 tests + fuzz target) covers:
+- **`whatsapp-bridge/security_test.go`** (24 tests + fuzz target) covers:
   - recipient parsing;
   - config validation;
   - token and file permissions;
   - every API guard (Host, Origin, method, token, content type, body size, unknown
-    fields, allowlist, read-only, rate limit);
-  - the media path allowlist (symlink, hidden, store secrets, FIFO);
+    fields, allowlist, allowlist-or-opt-in default, read-only, rate limit);
+  - the media path allowlist (symlink, hard link, hidden, store secrets, FIFO, home
+    directory refused as an allowed directory);
   - download-path containment against hostile filenames, IDs and JIDs;
   - the extension allowlist, case-collision naming and cached-file verification;
   - the media download size cap;
   - the cross-sender overwrite fix and the schema migration;
   - direct-path validation;
   - the Ogg parser (fixture duration + 2,000 mutated inputs + fuzzing).
-- **`whatsapp-mcp-server/tests/test_security.py`** (31 tests) covers:
+- **`whatsapp-mcp-server/tests/test_security.py`** (34 tests) covers:
   - transcript-forgery resistance, control/bidi stripping and invisible-Unicode removal
     (with emoji and script preservation);
   - exact matching and `LIKE` escaping;
   - query clamps;
   - the read-only DB;
-  - the media path allowlist;
-  - the recipient allowlist;
+  - the media path allowlist (including hard links and the home-directory refusal);
+  - the recipient allowlist and the refuse-by-default rule;
   - token use with proxy settings ignored;
   - the loopback-only bridge URL;
   - the audio conversion lifecycle, common input formats and the ffmpeg playlist refusal;

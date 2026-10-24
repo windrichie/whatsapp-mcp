@@ -190,6 +190,35 @@ def test_media_path_allowlist(store, tmp_path, monkeypatch):
         whatsapp.validate_media_path(str(ssh / "id_ed25519"))
 
 
+def test_hard_linked_files_are_refused(store, tmp_path, bridge):
+    secret = tmp_path / "id_ed25519"
+    secret.write_text("key")
+    linked = store.outbox / "innocent.txt"
+    try:
+        os.link(secret, linked)
+    except OSError as e:
+        pytest.skip(f"cannot create hard link: {e}")
+    with pytest.raises(ValueError, match="hard link"):
+        whatsapp.validate_media_path(str(linked))
+    ok, message = whatsapp.send_file(MALLORY, str(linked))
+    assert not ok and "hard link" in message
+    assert bridge.requests == []
+
+
+def test_home_directory_cannot_be_an_allowed_media_dir(store, tmp_path, monkeypatch):
+    home = tmp_path / "home" / "me"
+    pictures = home / "Pictures"
+    pictures.mkdir(parents=True)
+    (pictures / "cat.jpg").write_text("jpeg")
+    monkeypatch.setenv("HOME", str(home))
+    for broad in [str(home), str(home.parent), os.path.abspath(os.sep)]:
+        monkeypatch.setenv("WHATSAPP_MEDIA_ALLOWED_DIRS", broad)
+        with pytest.raises(ValueError, match="home directory"):
+            whatsapp.validate_media_path(str(pictures / "cat.jpg"))
+    monkeypatch.setenv("WHATSAPP_MEDIA_ALLOWED_DIRS", str(pictures))
+    assert whatsapp.validate_media_path(str(pictures / "cat.jpg")) == (pictures / "cat.jpg").resolve()
+
+
 def test_send_file_outside_allowlist_never_reaches_bridge(store, bridge):
     ok, message = whatsapp.send_file(MALLORY, "/etc/passwd")
     assert not ok and "outside the allowed" in message
@@ -220,6 +249,18 @@ def test_recipient_allowlist_is_enforced_before_the_bridge(store, bridge, monkey
         ok, message = whatsapp.send_message(allowed, "hi")
         assert ok, (allowed, message)
     assert len(bridge.requests) == 4
+
+
+def test_sending_needs_allowlist_or_opt_in(store, bridge, monkeypatch):
+    monkeypatch.delenv("WHATSAPP_ALLOW_ANY_RECIPIENT")
+    for send in (
+        lambda: whatsapp.send_message(MALLORY, "secrets"),
+        lambda: whatsapp.send_file(MALLORY, "/etc/passwd"),
+        lambda: whatsapp.send_audio_message(MALLORY, "/etc/passwd"),
+    ):
+        ok, message = send()
+        assert not ok and "WHATSAPP_ALLOWED_RECIPIENTS" in message
+    assert bridge.requests == []
 
 
 def test_missing_token_is_reported(store, bridge):

@@ -23,9 +23,10 @@ This fork fixes the issues documented in [SECURITY_AUDIT.md](./SECURITY_AUDIT.md
 - Downloads are written to `whatsapp-bridge/store/media/<chat>/<type>_<message id>_<hash>.<ext>`; the sender's filename can no longer choose the path, and unusual extensions are saved as `.bin`.
 - The store is private to your user (`0700`/`0600`), and message text is no longer written to logs.
 - Tools return JSON, strip control characters, and tell the model that message content is untrusted. Send tools are marked destructive so your MCP client can ask before each send.
-- Optional guardrails: a recipient allowlist, a read-only mode and a send rate limit (see [Configuration](#configuration)).
+- Sending is off until you set a recipient allowlist (`WHATSAPP_ALLOWED_RECIPIENTS`). To send to anyone, you must opt in with `WHATSAPP_ALLOW_ANY_RECIPIENT=1`. There is also a read-only mode and a send rate limit (see [Configuration](#configuration)).
+- Files with more than one hard link are refused, and `WHATSAPP_MEDIA_ALLOWED_DIRS` cannot contain your home directory.
 
-**For the strongest protection against prompt injection**, set `WHATSAPP_ALLOWED_RECIPIENTS` or `WHATSAPP_READ_ONLY=1`, and keep per-call approval for the `send_*` tools in your MCP client.
+**For the strongest protection against prompt injection**, keep the allowlist short or use `WHATSAPP_READ_ONLY=1`, and keep per-call approval for the `send_*` tools in your MCP client. Group names are chosen by group members and can copy a contact's name, so check the recipient JID in each approval prompt.
 
 ## Installation
 
@@ -77,7 +78,7 @@ This fork fixes the issues documented in [SECURITY_AUDIT.md](./SECURITY_AUDIT.md
            "main.py"
          ],
          "env": {
-           // Optional guardrails, see "Configuration" below
+           // Who may receive messages; sending is refused until this is set. See "Configuration" below
            "WHATSAPP_ALLOWED_RECIPIENTS": "447700900123,120363025246125486@g.us"
          }
        }
@@ -85,7 +86,7 @@ This fork fixes the issues documented in [SECURITY_AUDIT.md](./SECURITY_AUDIT.md
    }
    ```
 
-   The MCP server enforces the allowlist and read-only mode itself. Set them for the bridge too (in the environment where you run `go run .`), so they hold even if something else gets hold of the API token.
+   The MCP server enforces the allowlist and read-only mode itself. Set the same values for the bridge (in the environment where you run `go run .`): the bridge also refuses to send until it has an allowlist, and this way the limits hold even if something else gets hold of the API token.
 
    For **Claude**, save this as `claude_desktop_config.json` in your Claude Desktop configuration directory at:
 
@@ -133,9 +134,10 @@ All settings are environment variables. Set bridge settings where you run `go ru
 
 | Variable | Used by | Default | Purpose |
 |---|---|---|---|
-| `WHATSAPP_ALLOWED_RECIPIENTS` | both | unset (any individual or group) | Comma-separated phone numbers / JIDs that may receive messages. Strongly recommended. |
+| `WHATSAPP_ALLOWED_RECIPIENTS` | both | unset (sending refused) | Comma-separated phone numbers / JIDs that may receive messages. Required for sending, unless `WHATSAPP_ALLOW_ANY_RECIPIENT` is set. |
+| `WHATSAPP_ALLOW_ANY_RECIPIENT` | both | off | `1` allows sending to any individual or group when no allowlist is set. A prompt injection can then send your messages to anyone, so use it only with per-call approval. |
 | `WHATSAPP_READ_ONLY` | both | off | `1` disables sending: the MCP server hides the `send_*` tools, and the bridge refuses sends. |
-| `WHATSAPP_MEDIA_ALLOWED_DIRS` | both | only `store/outbox` | Extra absolute directories (separated by `:` on macOS/Linux or `;` on Windows) from which files may be sent. |
+| `WHATSAPP_MEDIA_ALLOWED_DIRS` | both | only `store/outbox` | Extra absolute directories (separated by `:` on macOS/Linux or `;` on Windows) from which files may be sent. Your home directory and its parents are refused: inside an allowed directory only dot-files are blocked, so allowing home would expose `~/Library` (keychains, browser cookies). List specific folders such as `~/Pictures/whatsapp-out`. |
 | `WHATSAPP_SEND_RATE_PER_MINUTE` | bridge | `10` | Maximum sends per minute (`0` = unlimited). |
 | `WHATSAPP_MAX_MEDIA_MB` | both | `100` | Maximum size of media sent or downloaded. |
 | `WHATSAPP_STORE_DIR` | both | `whatsapp-bridge/store` | Location of the session, database, token, outbox and media. Use the same absolute path for both. |
@@ -146,6 +148,7 @@ All settings are environment variables. Set bridge settings where you run `go ru
 ### Upgrading from upstream
 
 - Your existing login (`store/whatsapp.db`) and message history keep working. The bridge tightens file permissions and adds a `direct_path` column on first start.
+- Sending now needs `WHATSAPP_ALLOWED_RECIPIENTS` (or `WHATSAPP_ALLOW_ANY_RECIPIENT=1`) for both the bridge and the MCP server.
 - To send a file, copy it into `whatsapp-bridge/store/outbox/` first (or allow its directory with `WHATSAPP_MEDIA_ALLOWED_DIRS`).
 - New downloads go to `store/media/`. Files downloaded by the old version stay in `store/<chat jid>/`.
 - Tool results are now JSON objects instead of preformatted text.

@@ -735,6 +735,12 @@ func (s *apiServer) handleSend(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "sending is disabled (WHATSAPP_READ_ONLY is set)")
 		return
 	}
+	// Without an allowlist, a prompt-injected agent could send to anyone, so that
+	// needs an explicit opt-in.
+	if len(s.cfg.AllowedRecipients) == 0 && !s.cfg.AllowAnyRecipient {
+		writeError(w, http.StatusForbidden, "sending is disabled until WHATSAPP_ALLOWED_RECIPIENTS is set (or WHATSAPP_ALLOW_ANY_RECIPIENT=1)")
+		return
+	}
 
 	// Parse the request body
 	var req SendMessageRequest
@@ -775,7 +781,14 @@ func (s *apiServer) handleSend(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "source_path requires media_path")
 			return
 		}
-		if _, err := s.cfg.resolveSendablePath(req.SourcePath); err != nil {
+		source, err := s.cfg.resolveSendablePath(req.SourcePath)
+		if err == nil {
+			var f *os.File
+			if f, _, err = openSendableFile(source); err == nil {
+				f.Close()
+			}
+		}
+		if err != nil {
 			writeError(w, http.StatusForbidden, "source file: "+err.Error())
 			return
 		}
@@ -1029,9 +1042,10 @@ func main() {
 	fmt.Println("\n✓ Connected to WhatsApp!")
 	if cfg.ReadOnly {
 		fmt.Println("Read-only mode: sending messages is disabled.")
-	}
-	if len(cfg.AllowedRecipients) == 0 && !cfg.ReadOnly {
-		fmt.Println("Note: WHATSAPP_ALLOWED_RECIPIENTS is not set, so any individual or group can be messaged.")
+	} else if len(cfg.AllowedRecipients) == 0 && !cfg.AllowAnyRecipient {
+		fmt.Println("Sending is disabled: set WHATSAPP_ALLOWED_RECIPIENTS (or WHATSAPP_ALLOW_ANY_RECIPIENT=1) to enable it.")
+	} else if len(cfg.AllowedRecipients) == 0 {
+		fmt.Println("Warning: WHATSAPP_ALLOW_ANY_RECIPIENT is set, so any individual or group can be messaged.")
 	}
 
 	// Start REST API server

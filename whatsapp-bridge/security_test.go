@@ -31,6 +31,7 @@ func testConfig(t *testing.T) *Config {
 		MaxMediaBytes:     1 << 20,
 		SendRatePerMinute: 1000,
 		AllowedRecipients: map[string]bool{},
+		AllowAnyRecipient: true,
 	}
 	cfg.AllowedMediaDirs = []string{cfg.OutboxDir}
 	for _, dir := range []string{cfg.StoreDir, cfg.MediaDir, cfg.OutboxDir} {
@@ -119,6 +120,29 @@ func TestLoadConfigRejectsUnsafeSettings(t *testing.T) {
 	}
 	if cfg.ListenAddr != defaultListenAddr {
 		t.Errorf("default listen address = %s", cfg.ListenAddr)
+	}
+	if cfg.AllowAnyRecipient {
+		t.Error("sending to any recipient is enabled by default")
+	}
+}
+
+func TestLoadConfigRejectsHomeAsAllowedMediaDir(t *testing.T) {
+	t.Setenv("WHATSAPP_STORE_DIR", t.TempDir())
+	home := filepath.Join(t.TempDir(), "home", "me")
+	pictures := filepath.Join(home, "Pictures")
+	if err := os.MkdirAll(pictures, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	for _, dir := range []string{home, home + string(filepath.Separator), filepath.Dir(home), string(filepath.Separator)} {
+		t.Setenv("WHATSAPP_MEDIA_ALLOWED_DIRS", dir)
+		if _, err := loadConfig(); err == nil {
+			t.Errorf("loadConfig accepted %q, which contains the home directory", dir)
+		}
+	}
+	t.Setenv("WHATSAPP_MEDIA_ALLOWED_DIRS", pictures)
+	if _, err := loadConfig(); err != nil {
+		t.Errorf("loadConfig rejected a folder inside home: %v", err)
 	}
 }
 
@@ -315,6 +339,41 @@ func TestAPIAllowlistReadOnlyAndRateLimit(t *testing.T) {
 	cfg.ReadOnly = true
 	if rec, _ := doAPI(t, h, apiCase{body: `{"recipient":"447700900123","message":"hi"}`}); rec.Code != 403 {
 		t.Errorf("read-only: status %d", rec.Code)
+	}
+}
+
+func TestAPISendingNeedsAllowlistOrOptIn(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.AllowAnyRecipient = false
+	h := newAPIHandler(nil, testStore(t, cfg), cfg)
+	rec, out := doAPI(t, h, apiCase{body: `{"recipient":"447700900123","message":"hi"}`})
+	if rec.Code != 403 || !strings.Contains(out["message"].(string), "WHATSAPP_ALLOWED_RECIPIENTS") {
+		t.Errorf("no allowlist: status %d (%s)", rec.Code, rec.Body.String())
+	}
+	cfg.AllowAnyRecipient = true
+	if rec, _ := doAPI(t, h, apiCase{body: `{"recipient":"447700900123","message":"hi"}`}); rec.Code != 503 {
+		t.Errorf("opted in: status %d", rec.Code)
+	}
+}
+
+func TestAPIRefusesHardLinkedFiles(t *testing.T) {
+	cfg := testConfig(t)
+	h := newAPIHandler(nil, testStore(t, cfg), cfg)
+	secret := writeFile(t, filepath.Join(t.TempDir(), "id_ed25519"), "key")
+	linked := filepath.Join(cfg.OutboxDir, "innocent.txt")
+	if err := os.Link(secret, linked); err != nil {
+		t.Skipf("cannot create hard link: %v", err)
+	}
+	ok := writeFile(t, filepath.Join(cfg.OutboxDir, "ok.jpg"), "jpeg")
+
+	if rec, _ := doAPI(t, h, apiCase{body: `{"recipient":"447700900123","media_path":"` + linked + `"}`}); rec.Code != 400 {
+		t.Errorf("hard-linked media: status %d", rec.Code)
+	}
+	if rec, _ := doAPI(t, h, apiCase{body: `{"recipient":"447700900123","media_path":"` + ok + `","source_path":"` + linked + `"}`}); rec.Code != 403 {
+		t.Errorf("hard-linked source: status %d", rec.Code)
+	}
+	if _, err := readMediaFile(linked, 10); err == nil || !strings.Contains(err.Error(), "hard link") {
+		t.Errorf("readMediaFile(hard link) = %v", err)
 	}
 }
 

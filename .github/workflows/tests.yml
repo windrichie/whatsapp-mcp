@@ -7,6 +7,7 @@ on:
 permissions:
   contents: read
 
+# Actions and tools are pinned to exact versions so a moved tag cannot change what runs.
 jobs:
   bridge:
     runs-on: ubuntu-latest
@@ -14,14 +15,14 @@ jobs:
       run:
         working-directory: whatsapp-bridge
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0 (reads the toolchain line in go.mod)
         with:
           go-version-file: whatsapp-bridge/go.mod
           cache-dependency-path: whatsapp-bridge/go.sum
       - run: go vet ./...
       - run: go test -race ./...
-      - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 
   mcp-server:
     runs-on: ubuntu-latest
@@ -29,7 +30,7 @@ jobs:
       run:
         working-directory: whatsapp-mcp-server
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
       - run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - run: uv run --frozen pytest -q tests

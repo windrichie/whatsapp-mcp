@@ -60,6 +60,9 @@ def store(tmp_path, monkeypatch):
     monkeypatch.setattr(whatsapp, "TOKEN_PATH", s.root / "api_token")
     monkeypatch.delenv("WHATSAPP_MEDIA_ALLOWED_DIRS", raising=False)
     monkeypatch.delenv("WHATSAPP_BRIDGE_TOKEN", raising=False)
+    monkeypatch.delenv("WHATSAPP_ALLOWED_RECIPIENTS", raising=False)
+    # Most tests send to arbitrary numbers; the default (refuse) has its own test.
+    monkeypatch.setenv("WHATSAPP_ALLOW_ANY_RECIPIENT", "1")
     return s
 
 
