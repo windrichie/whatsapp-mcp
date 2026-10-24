@@ -34,3 +34,4 @@ jobs:
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
       - run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - run: uv run --frozen pytest -q tests
+      - run: uv run --frozen pytest -q ../ghostwriter/tests
