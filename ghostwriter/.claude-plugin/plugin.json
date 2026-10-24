@@ -1,8 +1,0 @@
-{
-  "name": "solopreneur-ghostwriter",
-  "version": "0.1.0",
-  "description": "Drafts WhatsApp replies in a shop owner's own voice and sends them only to her own \"Message yourself\" chat for her to copy and send.",
-  "author": {"name": "whatsapp-mcp contributors"},
-  "license": "MIT",
-  "keywords": ["whatsapp", "drafts", "customer-replies", "small-business"]
-}

@@ -109,7 +109,7 @@ func TestBurstOfMessagesGivesOneDraft(t *testing.T) {
 func TestOwnerReplyCancelsDraft(t *testing.T) {
 	h := newDraftHarness(t, 50*time.Millisecond)
 	h.Incoming(aliceLID, "hello?", time.Now())
-	h.Outgoing(alicePN) // she answered from her phone; same person, phone-number JID
+	h.Outgoing(alicePN) // the owner answered from the phone; same person, phone-number JID
 	time.Sleep(150 * time.Millisecond)
 	if h.runs.Load() != 0 || len(h.messages()) != 0 {
 		t.Fatal("a draft was made although the owner had already replied")

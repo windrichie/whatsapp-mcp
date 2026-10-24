@@ -582,7 +582,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, drafts 
 	err = messageStore.StoreMessage(msg.Info.ID, chatJID, sender, content, msg.Info.Timestamp, msg.Info.IsFromMe, media)
 
 	// A customer message starts (or restarts) a draft timer; the owner's own message
-	// in that chat means she has answered, which cancels it
+	// in that chat means the owner has answered, which cancels it
 	if drafts != nil {
 		if msg.Info.IsFromMe {
 			drafts.Outgoing(msg.Info.Chat)

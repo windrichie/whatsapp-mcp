@@ -17,10 +17,10 @@ import (
 	"go.mau.fi/whatsmeow/types"
 )
 
-// Draft replies ("ghostwriter"). When a customer writes in a one-to-one chat, the
-// bridge waits until they stop typing, asks an external command for a draft reply and
-// sends the draft to the account's own "Message yourself" chat. The owner copies it
-// into the customer's chat herself. This is the only code that sends while
+// Draft replies. When a customer writes in a one-to-one chat, the bridge waits until
+// they stop typing, asks an external command for a draft reply and sends the draft to
+// the account's own "Message yourself" chat. The owner copies it into the customer's
+// chat and sends it themselves. This is the only code that sends while
 // WHATSAPP_READ_ONLY is set, and it can only ever reach the account itself: the AI
 // that writes the draft has no way to send anything.
 
@@ -162,7 +162,7 @@ func (d *drafter) Incoming(chat types.JID, text string, sent time.Time) {
 	p.timer = time.AfterFunc(d.delay, func() { d.fire(key, gen) })
 }
 
-// Outgoing records that the owner wrote in chat herself, which cancels its draft.
+// Outgoing records that the owner wrote in the chat, which cancels its draft.
 func (d *drafter) Outgoing(chat types.JID) {
 	key := d.key(context.Background(), chat)
 	d.mu.Lock()

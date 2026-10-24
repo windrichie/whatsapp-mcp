@@ -138,6 +138,12 @@ All settings are environment variables. Set bridge settings where you run `go ru
 | `WHATSAPP_ALLOW_ANY_RECIPIENT` | both | off | `1` allows sending to any individual or group when no allowlist is set. A prompt injection can then send your messages to anyone, so use it only with per-call approval. |
 | `WHATSAPP_READ_ONLY` | both | off | `1` disables sending: the MCP server hides the `send_*` tools, and the bridge refuses sends. |
 | `WHATSAPP_MEDIA_ALLOWED_DIRS` | both | only `store/outbox` | Extra absolute directories (separated by `:` on macOS/Linux or `;` on Windows) from which files may be sent. Your home directory and its parents are refused: inside an allowed directory only dot-files are blocked, so allowing home would expose `~/Library` (keychains, browser cookies). List specific folders such as `~/Pictures/whatsapp-out`. |
+| `WHATSAPP_DRAFTS` | bridge | off | `1` turns on draft replies (see [Draft replies](#draft-replies-optional)). |
+| `WHATSAPP_DRAFT_COMMAND` | bridge | unset | Absolute path of the executable draft command. Required when drafts are on. |
+| `WHATSAPP_DRAFT_DELAY_SECONDS` | bridge | `90` | Seconds of quiet after a customer's last message before a draft is made (5 to 3600). |
+| `WHATSAPP_DRAFTS_PER_HOUR` | bridge | `30` | Maximum drafts per hour (1 to 1000). |
+| `WHATSAPP_DRAFT_CHATS` | bridge | unset (every one-to-one chat) | Comma-separated phone numbers or `…@lid` JIDs that get drafts. Useful for testing with one chat. |
+| `WHATSAPP_DRAFT_SKIP_CHATS` | bridge | unset | Comma-separated phone numbers or `…@lid` JIDs that never get drafts, for example family and friends. |
 | `WHATSAPP_SEND_RATE_PER_MINUTE` | bridge | `10` | Maximum sends per minute (`0` = unlimited). |
 | `WHATSAPP_MAX_MEDIA_MB` | both | `100` | Maximum size of media sent or downloaded. |
 | `WHATSAPP_STORE_DIR` | both | `whatsapp-bridge/store` | Location of the session, database, token, outbox and media. Use the same absolute path for both. |
@@ -154,13 +160,18 @@ All settings are environment variables. Set bridge settings where you run `go ru
 - New downloads go to `store/media/`. Files downloaded by the old version stay in `store/<chat jid>/`.
 - Tool results are now JSON objects instead of preformatted text.
 
-## Draft replies for customers (Ghostwriter)
+## Draft replies (optional)
 
-The [`ghostwriter/`](./ghostwriter) folder is a Claude Code plugin, `solopreneur-ghostwriter`. It drafts replies to customers in the owner's own voice. When a customer writes and then goes quiet, the bridge asks for a draft and sends it to the owner's own "Message yourself" chat. She copies it into the customer's chat and sends it herself.
+The bridge can draft replies to your customers. When someone writes to you in a one-to-one chat and then goes quiet, the bridge runs a draft command for that chat and sends the result to your own "Message yourself" chat. You copy the draft into the customer's chat and send it yourself. Nothing is sent to a customer automatically.
 
-- It is off unless you set `WHATSAPP_DRAFTS=1` and `WHATSAPP_DRAFT_COMMAND`. Keep `WHATSAPP_READ_ONLY=1`: drafts use their own path, which can only send to the account itself.
-- The AI that writes a draft has no tools. It gets the chat, the owner's voice guide, templates and facts as text, and returns text.
-- Learn the voice and templates from past messages with the plugin's skills. Setup and settings are in [ghostwriter/README.md](./ghostwriter/README.md).
+- Drafts are off unless you set `WHATSAPP_DRAFTS=1` and `WHATSAPP_DRAFT_COMMAND` (see [Configuration](#configuration)). Keep `WHATSAPP_READ_ONLY=1`: drafts use their own path, which can only send to your own account.
+- [Ghostwriter](https://github.com/windrichie/solopreneur-ghostwriter) is a ready-made draft command. It is a Claude Code plugin that learns your voice and your usual replies, and writes each draft with an AI that has no tools. Its README covers the setup.
+- To draft one chat on demand, call `POST /api/draft` with `{"chat_jid": "..."}` (a JID or a phone number) and the API token, like the other API calls. The draft goes to your own chat.
+- Any program can be the draft command if it follows this contract:
+  - The bridge runs `<WHATSAPP_DRAFT_COMMAND> <chat_jid>` with `WHATSAPP_STORE_DIR` (the absolute path of the store) and `GHOSTWRITER_CHAT_JID` in its environment. The command reads the chat from `messages.db` itself; message text is never passed on the command line.
+  - On success it exits 0 and prints exactly one JSON object, `{"reply": "...", "note": "..."}`, and nothing else (at most 64 KiB). An empty `reply` means "no draft". The bridge sends the note in a header message, then the reply on its own, so it copies cleanly.
+  - On failure it exits non-zero; the bridge logs the first line of its standard error.
+  - It must finish within 3 minutes; after that the bridge kills it and its child processes.
 
 ## Architecture Overview
 
