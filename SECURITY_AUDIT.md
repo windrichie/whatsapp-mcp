@@ -415,6 +415,28 @@ that no secrets are in the git history. It found these, now fixed:
 | Low | `WHATSAPP_MEDIA_ALLOWED_DIRS` blocked only dot-files, so allowing the home directory exposed `~/Library` (keychains, browser cookies) | The home directory and its parents are refused as allowed directories |
 | Info | CI ran `govulncheck@latest` and actions by moving tags | Actions are pinned to commit SHAs and govulncheck to v1.9.0 |
 
+### LID contacts and chat recency
+
+A live test showed that the following are now fixed. Each fix keeps the controls above:
+
+- **Names come from the address book only.** Individual chats (now keyed by LID) are
+  named from the address book through WhatsApp's LID-to-phone mapping. If there is no
+  saved name, the phone number is used. Push names and business names are chosen by
+  the sender, so they are never used. The mapping and the names are copied into a
+  `contacts` table, which the MCP server reads to name group senders.
+- **The allowlist follows the mapping.** An allowlisted phone number also allows that
+  person's LID, and an allowlisted LID allows that person's phone number. Both the
+  bridge and the MCP server check this, and the mapping comes from WhatsApp. A LID
+  without a known mapping is still refused.
+- **History sync records the real group sender.** Earlier, every group message from
+  history sync was stored with the group's ID as the sender. The bridge now stores the
+  participant. Only history sync, which comes from the user's own phone, may repair the
+  old rows. A live message with a reused ID still cannot take over another person's
+  archived message (L1). The MCP server reports the old rows as "sender unknown".
+- **Chat times only move forward.** A chat's last-message time can no longer move
+  backwards, and the old rows are repaired when the bridge starts. `list_chats` shows
+  the newest stored message.
+
 Note: `GOOS=windows go vet` still fails on the test file, because the FIFO test calls
 `syscall.Mkfifo`. That was already the case before this review. The bridge itself builds
 for Windows.
@@ -449,3 +471,20 @@ for Windows.
   - a full MCP stdio round-trip checking instructions, tool annotations and structured
     output;
   - read-only mode hiding the send tools.
+- **`whatsapp-bridge/contacts_test.go`** (8 tests) covers:
+  - LID-to-address-book naming, with push names ignored;
+  - the contacts table sync and the renaming of placeholder chat names;
+  - chat times that never move backwards (compared as instants across time zones),
+    and the startup repair;
+  - the newest-message time in history sync and the group sender taken from the
+    participant field;
+  - the rule that only history sync may repair a group-ID sender;
+  - LID/phone equivalence in the allowlist.
+- **`whatsapp-mcp-server/tests/test_contacts.py`** (7 tests) covers:
+  - names and phone numbers for LID chats;
+  - group senders named from the address book;
+  - unknown senders reported as unknown;
+  - phone-number lookups that find LID chats;
+  - the allowlist across a person's LID and phone number;
+  - the newest stored message as `last_message`;
+  - databases from older bridges.

@@ -139,21 +139,54 @@ def _connect() -> sqlite3.Connection:
     """Open the bridge's message database read-only; only the bridge writes to it."""
     uri = MESSAGES_DB_PATH.resolve().as_uri() + "?mode=ro"
     try:
-        return sqlite3.connect(uri, uri=True, timeout=5)
+        conn = sqlite3.connect(uri, uri=True, timeout=5)
+        # Bridges older than the contacts table: use an empty stand-in until it restarts
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'contacts'").fetchone():
+            conn.execute("CREATE TEMP TABLE contacts (jid TEXT PRIMARY KEY, phone TEXT, name TEXT)")
+        return conn
     except sqlite3.Error as e:
         raise RuntimeError(f"Cannot open the WhatsApp message database at {MESSAGES_DB_PATH}. Is the bridge running? ({e})") from e
 
 
+def _jid_aliases(cursor: sqlite3.Cursor, value: str) -> List[str]:
+    """JIDs for the same person as value (a phone number or JID).
+
+    WhatsApp addresses most people by a LID (...@lid) as well as by phone number. The
+    bridge mirrors WhatsApp's mapping between the two into the contacts table.
+    """
+    jid = _normalize_recipient(value if "@" in value else re.sub(r"\D", "", value))
+    aliases = [jid]
+    if jid.endswith("@s.whatsapp.net"):
+        rows = cursor.execute("SELECT jid FROM contacts WHERE phone = ? AND jid LIKE '%@lid'", (_jid_user(jid),))
+        aliases += [row[0] for row in rows]
+    elif jid.endswith("@lid"):
+        row = cursor.execute("SELECT phone FROM contacts WHERE jid = ?", (jid,)).fetchone()
+        if row and row[0]:
+            aliases.append(f"{row[0]}@s.whatsapp.net")
+    return aliases
+
+
+def _placeholders(values: List[Any]) -> str:
+    return ", ".join("?" * len(values))
+
+
 def _sender_name(cursor: sqlite3.Cursor, sender: str, cache: Dict[str, str]) -> str:
-    """Resolve a sender to a chat name by exact JID match only."""
+    """Resolve a sender by exact JID match: the address book, then chat names, then the phone number."""
     if sender in cache:
         return cache[sender]
     candidates = [sender] if "@" in sender else [f"{sender}@s.whatsapp.net", f"{sender}@lid", sender]
     name = None
-    for jid in candidates:
-        row = cursor.execute("SELECT name FROM chats WHERE jid = ? LIMIT 1", (jid,)).fetchone()
-        if row and row[0]:
-            name = row[0]
+    for sql in (
+        "SELECT name FROM contacts WHERE jid = ? LIMIT 1",
+        "SELECT name FROM chats WHERE jid = ? LIMIT 1",
+        "SELECT phone FROM contacts WHERE jid = ? LIMIT 1",
+    ):
+        for jid in candidates:
+            row = cursor.execute(sql, (jid,)).fetchone()
+            if row and row[0]:
+                name = row[0]
+                break
+        if name:
             break
     cache[sender] = name or sender
     return cache[sender]
@@ -167,6 +200,15 @@ _MESSAGE_COLUMNS = """
 
 def _message_dict(row: Tuple, cursor: sqlite3.Cursor, names: Dict[str, str], is_context: bool = False) -> Dict[str, Any]:
     timestamp, sender, chat_name, content, is_from_me, chat_jid, msg_id, media_type = row
+    # Older bridges stored the group's own ID as the sender of synced group history
+    if not is_from_me and (not sender or (chat_jid.endswith("@g.us") and sender == _jid_user(chat_jid))):
+        sender = None
+    if is_from_me:
+        sender_name = "Me"
+    elif sender is None:
+        sender_name = None  # unknown
+    else:
+        sender_name = clean_line(_sender_name(cursor, sender, names))
     message = {
         "id": clean_line(msg_id),
         "chat_jid": chat_jid,
@@ -174,7 +216,7 @@ def _message_dict(row: Tuple, cursor: sqlite3.Cursor, names: Dict[str, str], is_
         "timestamp": _iso(timestamp),
         "from_me": bool(is_from_me),
         "sender": clean_line(sender),
-        "sender_name": "Me" if is_from_me else clean_line(_sender_name(cursor, sender or "", names)),
+        "sender_name": sender_name,
         "content": clean_text(content),
     }
     if media_type:
@@ -184,14 +226,23 @@ def _message_dict(row: Tuple, cursor: sqlite3.Cursor, names: Dict[str, str], is_
     return message
 
 
+def _phone_number(jid: str, phone: Optional[str]) -> Optional[str]:
+    if not phone and jid.endswith("@s.whatsapp.net"):
+        phone = _jid_user(jid)
+    # Service accounts such as 0@s.whatsapp.net have no real phone number
+    return phone if phone and phone.isdigit() and 6 <= len(phone) <= 15 else None
+
+
 def _chat_dict(row: Tuple) -> Dict[str, Any]:
-    jid, name, last_message_time, last_message, last_sender, last_is_from_me = row
+    jid, name, last_message_time, phone, last_message, last_sender, last_is_from_me = row
     chat = {
         "jid": jid,
         "name": clean_line(name),
         "is_group": jid.endswith("@g.us"),
         "last_message_time": _iso(last_message_time),
     }
+    if _phone_number(jid, phone):
+        chat["phone_number"] = _phone_number(jid, phone)
     if last_message is not None or last_sender is not None:
         chat["last_message"] = clean_text(last_message)
         chat["last_sender"] = clean_line(last_sender)
@@ -236,38 +287,40 @@ def list_messages(
     context_after = _clamp(context_after, 0, MAX_CONTEXT, 1)
     query = _check_query(query)
 
-    where_clauses = []
-    params: List[Any] = []
-    if after:
-        try:
-            where_clauses.append("messages.timestamp > ?")
-            params.append(datetime.fromisoformat(after).isoformat(sep=" "))
-        except ValueError:
-            raise ValueError(f"Invalid date format for 'after': {after}. Please use ISO-8601 format.")
-    if before:
-        try:
-            where_clauses.append("messages.timestamp < ?")
-            params.append(datetime.fromisoformat(before).isoformat(sep=" "))
-        except ValueError:
-            raise ValueError(f"Invalid date format for 'before': {before}. Please use ISO-8601 format.")
-    if sender_phone_number:
-        where_clauses.append("messages.sender = ?")
-        params.append(_jid_user(sender_phone_number))
-    if chat_jid:
-        where_clauses.append("messages.chat_jid = ?")
-        params.append(chat_jid)
-    if query:
-        where_clauses.append("LOWER(messages.content) LIKE LOWER(?) ESCAPE '\\'")
-        params.append(_like_pattern(query))
-
-    sql = f"SELECT {_MESSAGE_COLUMNS} FROM messages JOIN chats ON messages.chat_jid = chats.jid"
-    if where_clauses:
-        sql += " WHERE " + " AND ".join(where_clauses)
-    sql += " ORDER BY messages.timestamp DESC LIMIT ? OFFSET ?"
-    params.extend([limit, page * limit])
-
     with closing(_connect()) as conn:
         cursor = conn.cursor()
+        where_clauses = []
+        params: List[Any] = []
+        if after:
+            try:
+                where_clauses.append("messages.timestamp > ?")
+                params.append(datetime.fromisoformat(after).isoformat(sep=" "))
+            except ValueError:
+                raise ValueError(f"Invalid date format for 'after': {after}. Please use ISO-8601 format.")
+        if before:
+            try:
+                where_clauses.append("messages.timestamp < ?")
+                params.append(datetime.fromisoformat(before).isoformat(sep=" "))
+            except ValueError:
+                raise ValueError(f"Invalid date format for 'before': {before}. Please use ISO-8601 format.")
+        if sender_phone_number:
+            # The bridge stores the sender's user part, which is a LID for most people
+            senders = [_jid_user(jid) for jid in _jid_aliases(cursor, sender_phone_number)]
+            where_clauses.append(f"messages.sender IN ({_placeholders(senders)})")
+            params.extend(senders)
+        if chat_jid:
+            where_clauses.append("messages.chat_jid = ?")
+            params.append(chat_jid)
+        if query:
+            where_clauses.append("LOWER(messages.content) LIKE LOWER(?) ESCAPE '\\'")
+            params.append(_like_pattern(query))
+
+        sql = f"SELECT {_MESSAGE_COLUMNS} FROM messages JOIN chats ON messages.chat_jid = chats.jid"
+        if where_clauses:
+            sql += " WHERE " + " AND ".join(where_clauses)
+        sql += " ORDER BY messages.timestamp DESC LIMIT ? OFFSET ?"
+        params.extend([limit, page * limit])
+
         names: Dict[str, str] = {}
         rows = cursor.execute(sql, tuple(params)).fetchall()
         if not include_context:
@@ -326,9 +379,21 @@ def get_message_context(
         }
 
 
-_CHAT_COLUMNS_WITH_LAST = "c.jid, c.name, c.last_message_time, m.content, m.sender, m.is_from_me"
-_CHAT_COLUMNS_ONLY = "c.jid, c.name, c.last_message_time, NULL, NULL, NULL"
-_LAST_MESSAGE_JOIN = "LEFT JOIN messages m ON c.jid = m.chat_jid AND c.last_message_time = m.timestamp"
+_CHAT_COLUMNS_WITH_LAST = "c.jid, c.name, c.last_message_time, k.phone, m.content, m.sender, m.is_from_me"
+_CHAT_COLUMNS_ONLY = "c.jid, c.name, c.last_message_time, k.phone, NULL, NULL, NULL"
+_CHATS_ONLY = "chats c LEFT JOIN contacts k ON k.jid = c.jid"
+# The newest stored message, not one matched on last_message_time: a chat's last activity
+# can be a reaction or another kind of message that is not stored.
+_CHATS_WITH_LAST = _CHATS_ONLY + """
+    LEFT JOIN messages m ON m.rowid = (
+        SELECT rowid FROM messages WHERE chat_jid = c.jid ORDER BY timestamp DESC LIMIT 1
+    )"""
+
+
+def _chat_select(include_last_message: bool) -> str:
+    if include_last_message:
+        return f"SELECT {_CHAT_COLUMNS_WITH_LAST} FROM {_CHATS_WITH_LAST}"
+    return f"SELECT {_CHAT_COLUMNS_ONLY} FROM {_CHATS_ONLY}"
 
 
 def list_chats(
@@ -345,14 +410,11 @@ def list_chats(
     if sort_by not in ("last_active", "name"):
         raise ValueError("sort_by must be 'last_active' or 'name'")
 
-    if include_last_message:
-        sql = f"SELECT {_CHAT_COLUMNS_WITH_LAST} FROM chats c {_LAST_MESSAGE_JOIN}"
-    else:
-        sql = f"SELECT {_CHAT_COLUMNS_ONLY} FROM chats c"
+    sql = _chat_select(include_last_message)
     params: List[Any] = []
     if query:
-        sql += " WHERE (LOWER(c.name) LIKE LOWER(?) ESCAPE '\\' OR c.jid LIKE ? ESCAPE '\\')"
-        params.extend([_like_pattern(query), _like_pattern(query)])
+        sql += " WHERE (LOWER(c.name) LIKE LOWER(?) ESCAPE '\\' OR c.jid LIKE ? ESCAPE '\\' OR k.phone LIKE ? ESCAPE '\\')"
+        params.extend([_like_pattern(query)] * 3)
     sql += " ORDER BY " + ("c.last_message_time DESC" if sort_by == "last_active" else "c.name")
     sql += " LIMIT ? OFFSET ?"
     params.extend([limit, page * limit])
@@ -366,16 +428,19 @@ def search_contacts(query: str) -> List[Dict[str, Any]]:
     query = _check_query(query) or ""
     pattern = _like_pattern(query)
     with closing(_connect()) as conn:
-        rows = conn.execute("""
-            SELECT DISTINCT jid, name
-            FROM chats
+        rows = conn.execute(f"""
+            SELECT DISTINCT c.jid, c.name, k.phone
+            FROM {_CHATS_ONLY}
             WHERE
-                (LOWER(name) LIKE LOWER(?) ESCAPE '\\' OR LOWER(jid) LIKE LOWER(?) ESCAPE '\\')
-                AND jid NOT LIKE '%@g.us'
-            ORDER BY name, jid
+                (LOWER(c.name) LIKE LOWER(?) ESCAPE '\\' OR LOWER(c.jid) LIKE LOWER(?) ESCAPE '\\' OR k.phone LIKE ? ESCAPE '\\')
+                AND c.jid NOT LIKE '%@g.us'
+            ORDER BY c.name, c.jid
             LIMIT 50
-        """, (pattern, pattern)).fetchall()
-    return [{"phone_number": _jid_user(jid), "name": clean_line(name), "jid": jid} for jid, name in rows]
+        """, (pattern, pattern, pattern)).fetchall()
+    return [
+        {"phone_number": _phone_number(jid, phone), "name": clean_line(name), "jid": jid}
+        for jid, name, phone in rows
+    ]
 
 
 def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Dict[str, Any]]:
@@ -383,14 +448,15 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Dict[str
     limit = _clamp(limit, 1, MAX_LIMIT, 20)
     page = _clamp(page, 0, 10_000, 0)
     with closing(_connect()) as conn:
+        aliases = _jid_aliases(conn.cursor(), jid)
+        senders = [_jid_user(a) for a in aliases]
         rows = conn.execute(f"""
-            SELECT {_CHAT_COLUMNS_WITH_LAST}
-            FROM chats c {_LAST_MESSAGE_JOIN}
-            WHERE c.jid = ?
-               OR EXISTS (SELECT 1 FROM messages s WHERE s.chat_jid = c.jid AND s.sender IN (?, ?))
+            {_chat_select(True)}
+            WHERE c.jid IN ({_placeholders(aliases)})
+               OR EXISTS (SELECT 1 FROM messages s WHERE s.chat_jid = c.jid AND s.sender IN ({_placeholders(senders)}))
             ORDER BY c.last_message_time DESC
             LIMIT ? OFFSET ?
-        """, (jid, jid, _jid_user(jid), limit, page * limit)).fetchall()
+        """, (*aliases, *senders, limit, page * limit)).fetchall()
     return [_chat_dict(row) for row in rows]
 
 
@@ -398,24 +464,22 @@ def get_last_interaction(jid: str) -> Optional[Dict[str, Any]]:
     """Get most recent message involving the contact."""
     with closing(_connect()) as conn:
         cursor = conn.cursor()
+        aliases = _jid_aliases(cursor, jid)
+        senders = [_jid_user(a) for a in aliases]
         row = cursor.execute(f"""
             SELECT {_MESSAGE_COLUMNS}
             FROM messages JOIN chats ON messages.chat_jid = chats.jid
-            WHERE messages.sender IN (?, ?) OR chats.jid = ?
+            WHERE messages.sender IN ({_placeholders(senders)}) OR chats.jid IN ({_placeholders(aliases)})
             ORDER BY messages.timestamp DESC
             LIMIT 1
-        """, (jid, _jid_user(jid), jid)).fetchone()
+        """, (*senders, *aliases)).fetchone()
         return _message_dict(row, cursor, {}) if row else None
 
 
 def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Dict[str, Any]]:
     """Get chat metadata by JID."""
-    if include_last_message:
-        sql = f"SELECT {_CHAT_COLUMNS_WITH_LAST} FROM chats c {_LAST_MESSAGE_JOIN} WHERE c.jid = ?"
-    else:
-        sql = f"SELECT {_CHAT_COLUMNS_ONLY} FROM chats c WHERE c.jid = ?"
     with closing(_connect()) as conn:
-        row = conn.execute(sql, (chat_jid,)).fetchone()
+        row = conn.execute(_chat_select(include_last_message) + " WHERE c.jid = ?", (chat_jid,)).fetchone()
     return _chat_dict(row) if row else None
 
 
@@ -425,9 +489,11 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Dict[str, A
     if not 6 <= len(digits) <= 15:
         raise ValueError("Phone number must contain 6 to 15 digits including the country code")
     with closing(_connect()) as conn:
+        # Most direct chats are keyed by the person's LID, not their phone number
+        aliases = _jid_aliases(conn.cursor(), digits)
         row = conn.execute(
-            f"SELECT {_CHAT_COLUMNS_WITH_LAST} FROM chats c {_LAST_MESSAGE_JOIN} WHERE c.jid = ? LIMIT 1",
-            (f"{digits}@s.whatsapp.net",),
+            f"{_chat_select(True)} WHERE c.jid IN ({_placeholders(aliases)}) ORDER BY c.last_message_time DESC LIMIT 1",
+            tuple(aliases),
         ).fetchone()
     return _chat_dict(row) if row else None
 
@@ -589,6 +655,15 @@ def _allowed_recipients() -> set:
     return {_normalize_recipient(e) for e in entries if e.strip()}
 
 
+def _recipient_aliases(recipient: str) -> List[str]:
+    """The recipient's JID plus its LID or phone-number JID (the bridge checks the same)."""
+    try:
+        with closing(_connect()) as conn:
+            return _jid_aliases(conn.cursor(), recipient)
+    except (RuntimeError, sqlite3.Error):
+        return [_normalize_recipient(recipient)]
+
+
 def _check_recipient(recipient: str) -> Optional[str]:
     if not recipient or not recipient.strip():
         return "Recipient must be provided"
@@ -596,7 +671,7 @@ def _check_recipient(recipient: str) -> Optional[str]:
         return "Recipient is too long"
     allowed = _allowed_recipients()
     if allowed:
-        if _normalize_recipient(recipient) not in allowed:
+        if not allowed & set(_recipient_aliases(recipient)):
             return "Recipient is not listed in WHATSAPP_ALLOWED_RECIPIENTS"
     elif not env_flag("WHATSAPP_ALLOW_ANY_RECIPIENT"):
         # Without an allowlist, a prompt-injected agent could send to anyone.

@@ -3,3 +3,5 @@ claude_desktop_config.json
 whatsapp.log
 # Bridge state: session keys, message DB, API token, media. Never commit.
 whatsapp-bridge/store/
+# Binary from `go build` in whatsapp-bridge/
+whatsapp-bridge/whatsapp-client

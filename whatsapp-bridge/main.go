@@ -25,6 +25,8 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/proto/waHistorySync"
+	"go.mau.fi/whatsmeow/proto/waWeb"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -104,6 +106,34 @@ func NewMessageStore(storeDir string) (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to migrate messages table: %v", err)
 	}
 
+	// The contacts table mirrors the address book and LID mappings for the MCP server
+	// (see SyncContacts). Older versions let history sync move a chat's
+	// last_message_time backwards, so repair it from the stored messages.
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS contacts (
+			jid TEXT PRIMARY KEY,
+			phone TEXT,
+			name TEXT
+		);
+		CREATE INDEX IF NOT EXISTS contacts_phone ON contacts (phone);
+		CREATE INDEX IF NOT EXISTS messages_chat_time ON messages (chat_jid, timestamp);
+
+		UPDATE chats SET last_message_time = (
+			SELECT m.timestamp FROM messages m WHERE m.chat_jid = chats.jid
+			ORDER BY julianday(m.timestamp) DESC LIMIT 1
+		)
+		WHERE EXISTS (
+			SELECT 1 FROM messages m WHERE m.chat_jid = chats.jid AND (
+				chats.last_message_time IS NULL OR
+				julianday(m.timestamp) > julianday(chats.last_message_time)
+			)
+		);
+	`)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to migrate chats and contacts: %v", err)
+	}
+
 	return &MessageStore{db: db}, nil
 }
 
@@ -136,10 +166,19 @@ func (store *MessageStore) Close() error {
 	return store.db.Close()
 }
 
-// Store a chat in the database
+// Store a chat in the database. last_message_time only ever moves forward: history
+// sync delivers older messages after newer live ones.
 func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
 	_, err := store.db.Exec(
-		"INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
+		`INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)
+		ON CONFLICT(jid) DO UPDATE SET
+			name = COALESCE(NULLIF(excluded.name, ''), chats.name),
+			last_message_time = CASE
+				WHEN chats.last_message_time IS NULL
+					OR julianday(excluded.last_message_time) > julianday(chats.last_message_time)
+				THEN excluded.last_message_time
+				ELSE chats.last_message_time
+			END`,
 		jid, name, lastMessageTime,
 	)
 	return err
@@ -147,6 +186,17 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 
 // Store a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool, media MediaInfo) error {
+	return store.storeMessage(id, chatJID, sender, content, timestamp, isFromMe, media, false)
+}
+
+// StoreHistoryMessage stores a message from history sync, which comes from the user's
+// own phone. Unlike a live message, it may also repair rows where older versions
+// recorded the group's own ID as the sender.
+func (store *MessageStore) StoreHistoryMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool, media MediaInfo) error {
+	return store.storeMessage(id, chatJID, sender, content, timestamp, isFromMe, media, true)
+}
+
+func (store *MessageStore) storeMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool, media MediaInfo, fromHistory bool) error {
 	// Only store if there's actual content or media
 	if content == "" && media.Type == "" {
 		return nil
@@ -160,6 +210,8 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, direct_path, media_key, file_sha256, file_enc_sha256, file_length)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id, chat_jid) DO UPDATE SET
+			sender = excluded.sender,
+			is_from_me = excluded.is_from_me,
 			content = excluded.content,
 			timestamp = excluded.timestamp,
 			media_type = excluded.media_type,
@@ -170,9 +222,11 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 			file_sha256 = excluded.file_sha256,
 			file_enc_sha256 = excluded.file_enc_sha256,
 			file_length = excluded.file_length
-		WHERE messages.sender = excluded.sender AND messages.is_from_me = excluded.is_from_me`,
+		WHERE (messages.sender = excluded.sender AND messages.is_from_me = excluded.is_from_me)
+			OR (? AND excluded.sender != '' AND messages.chat_jid LIKE '%@g.us'
+				AND messages.sender = substr(messages.chat_jid, 1, instr(messages.chat_jid, '@') - 1))`,
 		id, chatJID, sender, content, timestamp, isFromMe, media.Type, media.Filename, media.URL, media.DirectPath,
-		media.MediaKey, media.FileSHA256, media.FileEncSHA256, media.FileLength,
+		media.MediaKey, media.FileSHA256, media.FileEncSHA256, media.FileLength, fromHistory,
 	)
 	return err
 }
@@ -483,7 +537,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	sender := msg.Info.Sender.User
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
-	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
+	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, logger)
 
 	// Update chat in database with the message timestamp (keeps last message time updated)
 	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
@@ -714,6 +768,7 @@ type apiServer struct {
 	store   *MessageStore
 	cfg     *Config
 	limiter *rateLimiter
+	lids    lidDirectory // nil when there is no client (tests)
 }
 
 func newAPIHandler(client *whatsmeow.Client, messageStore *MessageStore, cfg *Config) http.Handler {
@@ -723,6 +778,13 @@ func newAPIHandler(client *whatsmeow.Client, messageStore *MessageStore, cfg *Co
 		cfg:     cfg,
 		limiter: newRateLimiter(cfg.SendRatePerMinute, time.Minute),
 	}
+	if client != nil {
+		s.lids = client.Store.LIDs
+	}
+	return s.routes()
+}
+
+func (s *apiServer) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/send", s.protect(s.handleSend))
 	mux.HandleFunc("/api/download", s.protect(s.handleDownload))
@@ -755,7 +817,7 @@ func (s *apiServer) handleSend(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if len(s.cfg.AllowedRecipients) > 0 && !s.cfg.AllowedRecipients[recipientJID.String()] {
+	if len(s.cfg.AllowedRecipients) > 0 && !s.recipientAllowed(r.Context(), recipientJID) {
 		writeError(w, http.StatusForbidden, "recipient is not listed in WHATSAPP_ALLOWED_RECIPIENTS")
 		return
 	}
@@ -825,6 +887,26 @@ func (s *apiServer) handleSend(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, status, SendMessageResponse{Success: success, Message: message})
+}
+
+// recipientAllowed checks the allowlist. A person has both a phone-number JID and a
+// LID, and chats now mostly use the LID, so an allowlisted phone number also allows
+// that person's LID (and the other way round), using WhatsApp's own mapping.
+func (s *apiServer) recipientAllowed(ctx context.Context, jid types.JID) bool {
+	if s.cfg.AllowedRecipients[jid.String()] {
+		return true
+	}
+	if s.lids == nil {
+		return false
+	}
+	var other types.JID
+	switch jid.Server {
+	case types.HiddenUserServer:
+		other, _ = s.lids.GetPNForLID(ctx, jid)
+	case types.DefaultUserServer:
+		other, _ = s.lids.GetLIDForPN(ctx, jid)
+	}
+	return !other.IsEmpty() && s.cfg.AllowedRecipients[other.ToNonAD().String()]
 }
 
 // Handler for downloading media
@@ -984,6 +1066,15 @@ func main() {
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
 
+		case *events.AppStateSyncComplete:
+			// The address book arrives through app state sync
+			syncContacts(client, messageStore, logger)
+
+		case *events.Contact:
+			if !v.FromFullSync {
+				syncContacts(client, messageStore, logger)
+			}
+
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
 		}
@@ -1040,6 +1131,7 @@ func main() {
 	}
 
 	fmt.Println("\n✓ Connected to WhatsApp!")
+	syncContacts(client, messageStore, logger)
 	if cfg.ReadOnly {
 		fmt.Println("Read-only mode: sending messages is disabled.")
 	} else if len(cfg.AllowedRecipients) == 0 && !cfg.AllowAnyRecipient {
@@ -1073,83 +1165,69 @@ func main() {
 }
 
 // GetChatName determines the appropriate name for a chat based on JID and other info
-func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, chatJID string, conversation interface{}, sender string, logger waLog.Logger) string {
-	// First, check if chat already exists in database with a name
+func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, chatJID string, conversation interface{}, logger waLog.Logger) string {
+	// Individual chats are named from the local address book on every call, so a chat
+	// stored before its contact or LID mapping arrived gets its real name later
+	if jid.Server != types.GroupServer {
+		return newContactResolver(client).name(context.Background(), jid)
+	}
+
+	// Group names need a network call, so reuse the stored name when there is one
 	var existingName string
 	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
 	if err == nil && existingName != "" {
-		// Chat exists with a name, use that
 		return existingName
 	}
 
 	// Need to determine chat name
 	var name string
 
-	if jid.Server == "g.us" {
-		// This is a group chat
-		logger.Debugf("Getting name for group: %s", sanitizeForLog(chatJID))
+	// This is a group chat
+	logger.Debugf("Getting name for group: %s", sanitizeForLog(chatJID))
 
-		// Use conversation data if provided (from history sync)
-		if conversation != nil {
-			// Extract name from conversation if available
-			// This uses type assertions to handle different possible types
-			var displayName, convName *string
-			// Try to extract the fields we care about regardless of the exact type
-			v := reflect.ValueOf(conversation)
-			if v.Kind() == reflect.Ptr && !v.IsNil() {
-				v = v.Elem()
+	// Use conversation data if provided (from history sync)
+	if conversation != nil {
+		// Extract name from conversation if available
+		// This uses type assertions to handle different possible types
+		var displayName, convName *string
+		// Try to extract the fields we care about regardless of the exact type
+		v := reflect.ValueOf(conversation)
+		if v.Kind() == reflect.Ptr && !v.IsNil() {
+			v = v.Elem()
 
-				// Try to find DisplayName field
-				if displayNameField := v.FieldByName("DisplayName"); displayNameField.IsValid() && displayNameField.Kind() == reflect.Ptr && !displayNameField.IsNil() {
-					dn := displayNameField.Elem().String()
-					displayName = &dn
-				}
-
-				// Try to find Name field
-				if nameField := v.FieldByName("Name"); nameField.IsValid() && nameField.Kind() == reflect.Ptr && !nameField.IsNil() {
-					n := nameField.Elem().String()
-					convName = &n
-				}
+			// Try to find DisplayName field
+			if displayNameField := v.FieldByName("DisplayName"); displayNameField.IsValid() && displayNameField.Kind() == reflect.Ptr && !displayNameField.IsNil() {
+				dn := displayNameField.Elem().String()
+				displayName = &dn
 			}
 
-			// Use the name we found
-			if displayName != nil && *displayName != "" {
-				name = *displayName
-			} else if convName != nil && *convName != "" {
-				name = *convName
+			// Try to find Name field
+			if nameField := v.FieldByName("Name"); nameField.IsValid() && nameField.Kind() == reflect.Ptr && !nameField.IsNil() {
+				n := nameField.Elem().String()
+				convName = &n
 			}
 		}
 
-		// If we didn't get a name, try group info
-		if name == "" {
-			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
-			if err == nil && groupInfo.Name != "" {
-				name = groupInfo.Name
-			} else {
-				// Fallback name for groups
-				name = fmt.Sprintf("Group %s", jid.User)
-			}
+		// Use the name we found
+		if displayName != nil && *displayName != "" {
+			name = *displayName
+		} else if convName != nil && *convName != "" {
+			name = *convName
 		}
-
-		logger.Debugf("Using group name: %s", sanitizeForLog(name))
-	} else {
-		// This is an individual contact
-		logger.Debugf("Getting name for contact: %s", sanitizeForLog(chatJID))
-
-		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
-		if err == nil && contact.FullName != "" {
-			name = contact.FullName
-		} else if sender != "" {
-			// Fallback to sender
-			name = sender
-		} else {
-			// Last fallback to JID
-			name = jid.User
-		}
-
-		logger.Debugf("Using contact name: %s", sanitizeForLog(name))
 	}
+
+	// If we didn't get a name, try group info
+	if name == "" {
+		groupInfo, err := client.GetGroupInfo(context.Background(), jid)
+		if err == nil && groupInfo.Name != "" {
+			name = groupInfo.Name
+		} else {
+			// Fallback name for groups
+			name = fmt.Sprintf("Group %s", jid.User)
+		}
+	}
+
+	logger.Debugf("Using group name: %s", sanitizeForLog(name))
 
 	return name
 }
@@ -1175,22 +1253,15 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 		}
 
 		// Get appropriate chat name by passing the history sync conversation directly
-		name := GetChatName(client, messageStore, jid, chatJID, conversation, "", logger)
+		name := GetChatName(client, messageStore, jid, chatJID, conversation, logger)
 
 		// Process messages
 		messages := conversation.Messages
 		if len(messages) > 0 {
-			// Update chat with latest message timestamp
-			latestMsg := messages[0]
-			if latestMsg == nil || latestMsg.Message == nil {
-				continue
-			}
-
-			// Get timestamp from message info
-			timestamp := time.Time{}
-			if ts := latestMsg.Message.GetMessageTimestamp(); ts != 0 {
-				timestamp = time.Unix(int64(ts), 0)
-			} else {
+			// Update chat with the newest message timestamp; the order of messages in a
+			// sync blob is not guaranteed
+			timestamp := latestHistoryTimestamp(messages)
+			if timestamp.IsZero() {
 				continue
 			}
 
@@ -1224,25 +1295,10 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				}
 
 				// Determine sender
-				var sender string
-				isFromMe := false
-				if msg.Message.Key != nil {
-					if msg.Message.Key.FromMe != nil {
-						isFromMe = *msg.Message.Key.FromMe
-					}
-					if !isFromMe && msg.Message.Key.Participant != nil && *msg.Message.Key.Participant != "" {
-						// Store the user part, as live messages do, so duplicates match
-						sender = *msg.Message.Key.Participant
-						if participant, err := types.ParseJID(sender); err == nil {
-							sender = participant.User
-						}
-					} else if isFromMe {
-						sender = client.Store.ID.User
-					} else {
-						sender = jid.User
-					}
-				} else {
-					sender = jid.User
+				isFromMe := msg.Message.GetKey().GetFromMe()
+				sender := historySender(jid, msg.Message)
+				if isFromMe {
+					sender = client.Store.ID.User
 				}
 
 				// Store message
@@ -1259,7 +1315,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					continue
 				}
 
-				err = messageStore.StoreMessage(msgID, chatJID, sender, content, timestamp, isFromMe, media)
+				err = messageStore.StoreHistoryMessage(msgID, chatJID, sender, content, timestamp, isFromMe, media)
 				if err != nil {
 					logger.Warnf("Failed to store history message: %v", err)
 				} else {
@@ -1270,6 +1326,54 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 	}
 
 	fmt.Printf("History sync complete. Stored %d messages.\n", syncedCount)
+
+	// History sync carries LID-to-phone mappings, which can name more chats
+	syncContacts(client, messageStore, logger)
+}
+
+// historySender returns the user part of the sender of a message that someone else
+// sent, as live messages store it. In groups the sender is in the message's participant
+// field (older clients use the key's); when neither is set the sender is unknown (""),
+// never the group's own ID.
+func historySender(chat types.JID, msg *waWeb.WebMessageInfo) string {
+	if isIndividualServer(chat.Server) || chat.Server == types.NewsletterServer {
+		return chat.User
+	}
+	for _, participant := range []string{msg.GetParticipant(), msg.GetKey().GetParticipant()} {
+		if participant == "" {
+			continue
+		}
+		if jid, err := types.ParseJID(participant); err == nil {
+			return jid.User
+		}
+	}
+	return ""
+}
+
+// latestHistoryTimestamp returns the newest message time in a history sync conversation.
+func latestHistoryTimestamp(messages []*waHistorySync.HistorySyncMsg) time.Time {
+	var latest time.Time
+	for _, msg := range messages {
+		if msg == nil || msg.Message == nil {
+			continue
+		}
+		if ts := msg.Message.GetMessageTimestamp(); ts != 0 {
+			if t := time.Unix(int64(ts), 0); t.After(latest) {
+				latest = t
+			}
+		}
+	}
+	return latest
+}
+
+// syncContacts refreshes the contacts table and individual chat names.
+func syncContacts(client *whatsmeow.Client, messageStore *MessageStore, logger waLog.Logger) {
+	renamed, err := messageStore.SyncContacts(context.Background(), newContactResolver(client))
+	if err != nil {
+		logger.Warnf("Failed to sync contacts: %v", err)
+	} else if renamed > 0 {
+		fmt.Printf("Updated the names of %d chats from your contacts\n", renamed)
+	}
 }
 
 // Request history sync from the server

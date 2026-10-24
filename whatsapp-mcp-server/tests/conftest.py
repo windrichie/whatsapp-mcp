@@ -24,10 +24,15 @@ CREATE TABLE messages (
     PRIMARY KEY (id, chat_jid), FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 );
 """
+CONTACTS_SCHEMA = """
+CREATE TABLE contacts (jid TEXT PRIMARY KEY, phone TEXT, name TEXT);
+CREATE INDEX contacts_phone ON contacts (phone);
+CREATE INDEX messages_chat_time ON messages (chat_jid, timestamp);
+"""
 
 
 class Store:
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, with_contacts: bool = True):
         self.root = root
         self.outbox = root / "outbox"
         self.media = root / "media"
@@ -36,11 +41,15 @@ class Store:
             d.mkdir(mode=0o700, exist_ok=True)
         (root / "api_token").write_text(TOKEN + "\n")
         with sqlite3.connect(self.db_path) as conn:
-            conn.executescript(SCHEMA)
+            conn.executescript(SCHEMA + (CONTACTS_SCHEMA if with_contacts else ""))
 
     def chat(self, jid, name, last="2025-01-01 10:00:00+00:00"):
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("INSERT INTO chats VALUES (?, ?, ?)", (jid, name, last))
+
+    def contact(self, jid, phone=None, name=None):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("INSERT INTO contacts VALUES (?, ?, ?)", (jid, phone, name))
 
     def message(self, msg_id, chat_jid, sender, content, ts="2025-01-01 10:00:00+00:00", from_me=False, media_type=""):
         with sqlite3.connect(self.db_path) as conn:

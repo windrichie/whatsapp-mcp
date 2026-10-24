@@ -134,7 +134,7 @@ All settings are environment variables. Set bridge settings where you run `go ru
 
 | Variable | Used by | Default | Purpose |
 |---|---|---|---|
-| `WHATSAPP_ALLOWED_RECIPIENTS` | both | unset (sending refused) | Comma-separated phone numbers / JIDs that may receive messages. Required for sending, unless `WHATSAPP_ALLOW_ANY_RECIPIENT` is set. |
+| `WHATSAPP_ALLOWED_RECIPIENTS` | both | unset (sending refused) | Comma-separated phone numbers / JIDs that may receive messages. Required for sending, unless `WHATSAPP_ALLOW_ANY_RECIPIENT` is set. A phone number also allows the same person's LID (`…@lid`), using WhatsApp's own mapping. |
 | `WHATSAPP_ALLOW_ANY_RECIPIENT` | both | off | `1` allows sending to any individual or group when no allowlist is set. A prompt injection can then send your messages to anyone, so use it only with per-call approval. |
 | `WHATSAPP_READ_ONLY` | both | off | `1` disables sending: the MCP server hides the `send_*` tools, and the bridge refuses sends. |
 | `WHATSAPP_MEDIA_ALLOWED_DIRS` | both | only `store/outbox` | Extra absolute directories (separated by `:` on macOS/Linux or `;` on Windows) from which files may be sent. Your home directory and its parents are refused: inside an allowed directory only dot-files are blocked, so allowing home would expose `~/Library` (keychains, browser cookies). List specific folders such as `~/Pictures/whatsapp-out`. |
@@ -149,6 +149,7 @@ All settings are environment variables. Set bridge settings where you run `go ru
 
 - Your existing login (`store/whatsapp.db`) and message history keep working. The bridge tightens file permissions and adds a `direct_path` column on first start.
 - Sending now needs `WHATSAPP_ALLOWED_RECIPIENTS` (or `WHATSAPP_ALLOW_ANY_RECIPIENT=1`) for both the bridge and the MCP server.
+- Restart the bridge after updating. On start it renames individual chats from your address book and repairs chat times that history sync moved backwards. Older versions recorded the group's ID as the sender of every group message from history sync. These messages now show an unknown sender (`null`). To get the real senders, unlink the device on your phone (Settings > Linked Devices), restart the bridge and scan the QR code again. The new history sync then repairs those messages.
 - To send a file, copy it into `whatsapp-bridge/store/outbox/` first (or allow its directory with `WHATSAPP_MEDIA_ALLOWED_DIRS`).
 - New downloads go to `store/media/`. Files downloaded by the old version stay in `store/<chat jid>/`.
 - Tool results are now JSON objects instead of preformatted text.
@@ -165,6 +166,7 @@ This application consists of two main components:
 
 - All message history is stored in a SQLite database within the `whatsapp-bridge/store/` directory
 - The database maintains tables for chats and messages
+- WhatsApp now identifies most people by a LID (`…@lid`) instead of their phone number. The bridge copies WhatsApp's LID-to-phone mapping and the names in your phone's address book into a `contacts` table. Chats and group senders are named only from your address book, never from names that people choose for themselves. Phone-number lookups also find the person's LID chat.
 - Messages are indexed for efficient searching and retrieval
 - `store/whatsapp.db` holds your linked-device keys: anyone with a copy can act as this device. Never share or commit the `store` directory, and unlink the device from your phone (Settings > Linked Devices) if it leaks
 
